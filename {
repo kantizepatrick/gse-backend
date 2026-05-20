@@ -1,0 +1,1 @@
+app.get('/api/reports/low-stock', authenticateToken, async (req, res) =
