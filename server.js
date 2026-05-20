@@ -13,16 +13,12 @@ const SECRET_KEY = 'gse_inventory_secret_key_2024';
 app.use(cors());
 app.use(express.json());
 
-// Debug: Check if env variables are loaded
 console.log('Checking environment variables...');
 console.log('TURSO_DATABASE_URL exists?', process.env.TURSO_DATABASE_URL ? 'YES' : 'NO');
 console.log('TURSO_AUTH_TOKEN exists?', process.env.TURSO_AUTH_TOKEN ? 'YES' : 'NO');
 
 if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
   console.error('ERROR: Missing Turso credentials in .env file');
-  console.error('Please make sure .env file contains:');
-  console.error('TURSO_DATABASE_URL=libsql://your-database-url');
-  console.error('TURSO_AUTH_TOKEN=your-auth-token');
   process.exit(1);
 }
 
@@ -34,6 +30,7 @@ const db = createClient({
 console.log('✅ Connected to Turso cloud database');
 
 let emailTransporter = null;
+
 const setupEmail = async () => {
   try {
     const testAccount = await nodemailer.createTestAccount();
@@ -107,17 +104,25 @@ const authenticateToken = (req, res, next) => {
 
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
+  console.log(`Login attempt for: ${username}`);
   try {
     const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+    if (result.rows.length === 0) {
+      console.log(`User not found: ${username}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const user = result.rows[0];
+    console.log(`User found: ${user.username}, role: ${user.role}`);
     if (bcrypt.compareSync(password, user.password_hash)) {
       const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
+      console.log(`Login successful for: ${username}`);
       res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } });
     } else {
+      console.log(`Invalid password for: ${username}`);
       res.status(401).json({ error: 'Invalid credentials' });
     }
   } catch (err) {
+    console.error('Login error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -205,7 +210,9 @@ app.put('/api/parts/:id', authenticateToken, async (req, res) => {
 });
 
 app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin' && req.user.role !== 'manager') return res.status(403).json({ error: 'Admin or Manager only' });
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or Manager only' });
+  }
   try {
     await db.execute({ sql: 'DELETE FROM parts WHERE id = ?', args: [req.params.id] });
     res.json({ message: 'Part deleted successfully' });
@@ -266,7 +273,9 @@ app.post('/api/change-password', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute({ sql: 'SELECT password_hash FROM users WHERE id = ?', args: [req.user.id] });
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    if (!bcrypt.compareSync(current_password, result.rows[0].password_hash)) return res.status(401).json({ error: 'Current password is incorrect' });
+    if (!bcrypt.compareSync(current_password, result.rows[0].password_hash)) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
     const new_hash = bcrypt.hashSync(new_password, 10);
     await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [new_hash, req.user.id] });
     res.json({ message: 'Password changed successfully! Please login again.' });
@@ -296,7 +305,9 @@ app.post('/api/forgot-password', async (req, res) => {
   if (!username) return res.status(400).json({ error: 'Username is required' });
   try {
     const result = await db.execute({ sql: 'SELECT id, username, email FROM users WHERE username = ?', args: [username] });
-    if (result.rows.length === 0) return res.json({ message: 'If account exists, reset code has been sent.' });
+    if (result.rows.length === 0) {
+      return res.json({ message: 'If account exists, reset code has been sent.' });
+    }
     const user = result.rows[0];
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
     resetCodes.set(user.username, { code: resetCode, expires: Date.now() + 3600000 });
@@ -307,7 +318,10 @@ app.post('/api/forgot-password', async (req, res) => {
         to: user.email,
         subject: 'Password Reset Code',
         html: `<h2>Your Reset Code: ${resetCode}</h2><p>Expires in 1 hour.</p>`
-      }, (err) => { if (err) console.log(`Email error: ${err.message}`); else console.log(`Email sent to ${user.email}`); });
+      }, (err) => {
+        if (err) console.log(`Email error: ${err.message}`);
+        else console.log(`Email sent to ${user.email}`);
+      });
     }
     res.json({ message: 'Reset code sent!' });
   } catch (err) {
@@ -341,17 +355,21 @@ const createDefaultUsers = async () => {
   for (const user of defaultUsers) {
     try {
       await db.execute({ sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, args: user });
-    } catch (err) {}
+      console.log(`✅ User ${user[0]} created/verified`);
+    } catch (err) {
+      console.log(`Error creating user ${user[0]}:`, err.message);
+    }
   }
-  console.log('✅ Default users created');
+  const result = await db.execute('SELECT username FROM users');
+  console.log(`📋 Total users in database: ${result.rows.length}`);
+  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
 };
 setTimeout(createDefaultUsers, 3000);
 
 app.listen(PORT, () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`✅ Using Turso cloud database (free, never expires)`);
-  console.log(`✅ Login at http://localhost:3000`);
-  console.log(`\n📋 Default Logins:`);
+  console.log(`📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
