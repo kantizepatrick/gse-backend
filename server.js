@@ -366,6 +366,34 @@ const createDefaultUsers = async () => {
 };
 setTimeout(createDefaultUsers, 3000);
 
+// ========== DEBUG ENDPOINTS ==========
+app.get('/api/debug/users', async (req, res) => {
+  try {
+    const result = await db.execute('SELECT id, username, role FROM users');
+    res.json({ 
+      success: true, 
+      count: result.rows.length,
+      users: result.rows 
+    });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/debug/create-admin', async (req, res) => {
+  try {
+    const password_hash = bcrypt.hashSync('admin123', 10);
+    await db.execute({ 
+      sql: `INSERT OR REPLACE INTO users (id, username, password_hash, full_name, role, email) 
+            VALUES (1, 'admin', ?, 'System Admin', 'admin', 'admin@example.com')`, 
+      args: [password_hash] 
+    });
+    res.json({ success: true, message: 'Admin user created/updated' });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`✅ Using Turso cloud database (free, never expires)`);
