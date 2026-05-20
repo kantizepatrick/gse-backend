@@ -1,10 +1,10 @@
-require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@libsql/client');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -13,15 +13,7 @@ const SECRET_KEY = 'gse_inventory_secret_key_2024';
 app.use(cors());
 app.use(express.json());
 
-console.log('Checking environment variables...');
-console.log('TURSO_DATABASE_URL exists?', process.env.TURSO_DATABASE_URL ? 'YES' : 'NO');
-console.log('TURSO_AUTH_TOKEN exists?', process.env.TURSO_AUTH_TOKEN ? 'YES' : 'NO');
-
-if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
-  console.error('ERROR: Missing Turso credentials in .env file');
-  process.exit(1);
-}
-
+// Turso database connection
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
@@ -102,6 +94,7 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// ========== LOGIN ==========
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   console.log(`Login attempt for: ${username}`);
@@ -127,6 +120,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// ========== PARTS ==========
 app.get('/api/parts', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
@@ -136,79 +130,204 @@ app.get('/api/parts', authenticateToken, async (req, res) => {
   }
 });
 
+// ========== RECEIVE PARTS - THIS INCREASES STOCK ==========
 app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
+  
+  console.log(`📦 RECEIVE request: Part=${part_number}, Quantity=${quantity}, User=${req.user.username}`);
+  
+  const client = await db.connect();
   try {
-    const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
+    await client.execute('BEGIN TRANSACTION');
+    
+    // Get the part
+    const partResult = await client.execute({ 
+      sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', 
+      args: [part_number] 
+    });
+    
+    if (partResult.rows.length === 0) {
+      await client.execute('ROLLBACK');
+      console.log(`❌ Part not found: ${part_number}`);
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
     const part = partResult.rows[0];
-    await db.execute('BEGIN TRANSACTION');
-    await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by) VALUES (?, ?, ?, ?, ?, ?)', args: [part.id, 'RECEIVE', quantity, reference_number, notes, req.user.username] });
-    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand + ? WHERE id = ?', args: [quantity, part.id] });
-    await db.execute('COMMIT');
-    res.json({ message: 'Parts received successfully' });
+    const oldQuantity = part.quantity_on_hand;
+    const quantityNum = parseInt(quantity);
+    const newQuantity = oldQuantity + quantityNum;
+    
+    console.log(`📊 Stock update: ${oldQuantity} → ${newQuantity} (+${quantityNum})`);
+    
+    // Insert transaction record
+    await client.execute({ 
+      sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by) 
+            VALUES (?, ?, ?, ?, ?, ?)`, 
+      args: [part.id, 'RECEIVE', quantityNum, reference_number, notes, req.user.username] 
+    });
+    
+    // UPDATE THE PART QUANTITY - THIS INCREASES STOCK
+    await client.execute({ 
+      sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand + ? WHERE id = ?', 
+      args: [quantityNum, part.id] 
+    });
+    
+    await client.execute('COMMIT');
+    
+    console.log(`✅ Stock updated successfully for part ${part_number}`);
+    res.json({ 
+      success: true,
+      message: 'Parts received successfully',
+      oldQuantity: oldQuantity,
+      newQuantity: newQuantity,
+      added: quantityNum
+    });
+    
   } catch (err) {
-    await db.execute('ROLLBACK');
+    await client.execute('ROLLBACK');
+    console.error('❌ Error receiving parts:', err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.close();
   }
 });
 
+// ========== ISSUE PARTS - THIS DECREASES STOCK ==========
 app.post('/api/transactions/issue', authenticateToken, async (req, res) => {
   const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
+  
+  console.log(`📤 ISSUE request: Part=${part_number}, Quantity=${quantity}, User=${req.user.username}`);
+  
+  const client = await db.connect();
   try {
-    const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
+    await client.execute('BEGIN TRANSACTION');
+    
+    const partResult = await client.execute({ 
+      sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', 
+      args: [part_number] 
+    });
+    
+    if (partResult.rows.length === 0) {
+      await client.execute('ROLLBACK');
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
     const part = partResult.rows[0];
-    if (part.quantity_on_hand < quantity) return res.status(400).json({ error: 'Insufficient stock' });
-    await db.execute('BEGIN TRANSACTION');
-    await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', args: [part.id, 'ISSUE', quantity, gse_registration, technician_name, work_order, notes, req.user.username] });
-    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?', args: [quantity, part.id] });
-    await db.execute('COMMIT');
-    res.json({ message: 'Parts issued successfully' });
+    const quantityNum = parseInt(quantity);
+    
+    if (part.quantity_on_hand < quantityNum) {
+      await client.execute('ROLLBACK');
+      console.log(`❌ Insufficient stock: Have ${part.quantity_on_hand}, Need ${quantityNum}`);
+      return res.status(400).json({ error: 'Insufficient stock' });
+    }
+    
+    const oldQuantity = part.quantity_on_hand;
+    const newQuantity = oldQuantity - quantityNum;
+    
+    console.log(`📊 Stock update: ${oldQuantity} → ${newQuantity} (-${quantityNum})`);
+    
+    await client.execute({ 
+      sql: `INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, 
+      args: [part.id, 'ISSUE', quantityNum, gse_registration, technician_name, work_order, notes, req.user.username] 
+    });
+    
+    // UPDATE THE PART QUANTITY - THIS DECREASES STOCK
+    await client.execute({ 
+      sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?', 
+      args: [quantityNum, part.id] 
+    });
+    
+    await client.execute('COMMIT');
+    
+    console.log(`✅ Stock updated successfully for part ${part_number}`);
+    res.json({ 
+      success: true,
+      message: 'Parts issued successfully',
+      oldQuantity: oldQuantity,
+      newQuantity: newQuantity,
+      removed: quantityNum
+    });
+    
   } catch (err) {
-    await db.execute('ROLLBACK');
+    await client.execute('ROLLBACK');
+    console.error('❌ Error issuing parts:', err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.close();
   }
 });
 
+// ========== GET TRANSACTIONS ==========
 app.get('/api/transactions', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`SELECT t.*, p.part_number, p.description FROM transactions t JOIN parts p ON t.part_id = p.id ORDER BY t.created_at DESC LIMIT 50`);
+    const result = await db.execute(`
+      SELECT t.*, p.part_number, p.description 
+      FROM transactions t 
+      JOIN parts p ON t.part_id = p.id 
+      ORDER BY t.created_at DESC 
+      LIMIT 50
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ========== LOW STOCK REPORT ==========
 app.get('/api/reports/low-stock', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`SELECT part_number, description, quantity_on_hand, min_stock, location_bin FROM parts WHERE quantity_on_hand <= min_stock`);
+    const result = await db.execute(`
+      SELECT part_number, description, quantity_on_hand, min_stock, location_bin 
+      FROM parts 
+      WHERE quantity_on_hand <= min_stock
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ========== CREATE PART ==========
 app.post('/api/parts', authenticateToken, async (req, res) => {
   const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, contact_person, contact_phone, contact_email } = req.body;
   try {
-    const result = await db.execute({ sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, contact_person, contact_phone, contact_email) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`, args: [part_number, description, manufacturer, compatible_gse, location_bin, min_stock || 5, contact_person, contact_phone, contact_email] });
+    const result = await db.execute({ 
+      sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, contact_person, contact_phone, contact_email) 
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`, 
+      args: [part_number, description, manufacturer, compatible_gse, location_bin, min_stock || 5, contact_person, contact_phone, contact_email] 
+    });
     res.json({ id: result.lastInsertRowid, message: 'Part created successfully' });
   } catch (err) {
-    res.status(500).json({ error: 'Part number already exists' });
+    if (err.message.includes('UNIQUE')) {
+      res.status(500).json({ error: 'Part number already exists' });
+    } else {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
+// ========== UPDATE PART ==========
 app.put('/api/parts/:id', authenticateToken, async (req, res) => {
   const { contact_person, contact_phone, contact_email, location_bin, min_stock } = req.body;
   try {
-    await db.execute({ sql: `UPDATE parts SET contact_person = ?, contact_phone = ?, contact_email = ?, location_bin = ?, min_stock = ? WHERE id = ?`, args: [contact_person, contact_phone, contact_email, location_bin, min_stock, req.params.id] });
+    await db.execute({ 
+      sql: `UPDATE parts SET 
+            contact_person = ?, 
+            contact_phone = ?, 
+            contact_email = ?, 
+            location_bin = ?, 
+            min_stock = ? 
+            WHERE id = ?`, 
+      args: [contact_person, contact_phone, contact_email, location_bin, min_stock, req.params.id] 
+    });
     res.json({ message: 'Part updated successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ========== DELETE PART ==========
 app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager only' });
@@ -221,6 +340,7 @@ app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ========== USER MANAGEMENT ==========
 app.get('/api/users', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
@@ -237,7 +357,10 @@ app.post('/api/users', authenticateToken, async (req, res) => {
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
   const password_hash = bcrypt.hashSync(password, 10);
   try {
-    const result = await db.execute({ sql: `INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, args: [username, password_hash, full_name, role || 'storekeeper', email || null] });
+    const result = await db.execute({ 
+      sql: `INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
+      args: [username, password_hash, full_name, role || 'storekeeper', email || null] 
+    });
     res.json({ id: result.lastInsertRowid, message: 'User created successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Username already exists' });
@@ -248,7 +371,10 @@ app.put('/api/users/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { full_name, role, email } = req.body;
   try {
-    await db.execute({ sql: 'UPDATE users SET full_name = ?, role = ?, email = ? WHERE id = ?', args: [full_name, role, email, req.params.id] });
+    await db.execute({ 
+      sql: 'UPDATE users SET full_name = ?, role = ?, email = ? WHERE id = ?', 
+      args: [full_name, role, email, req.params.id] 
+    });
     res.json({ message: 'User updated successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -298,6 +424,7 @@ app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
   }
 });
 
+// ========== FORGOT PASSWORD ==========
 const resetCodes = new Map();
 
 app.post('/api/forgot-password', async (req, res) => {
@@ -346,26 +473,6 @@ app.post('/api/reset-password', async (req, res) => {
   }
 });
 
-const createDefaultUsers = async () => {
-  const defaultUsers = [
-    ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
-    ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
-    ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
-  ];
-  for (const user of defaultUsers) {
-    try {
-      await db.execute({ sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, args: user });
-      console.log(`✅ User ${user[0]} created/verified`);
-    } catch (err) {
-      console.log(`Error creating user ${user[0]}:`, err.message);
-    }
-  }
-  const result = await db.execute('SELECT username FROM users');
-  console.log(`📋 Total users in database: ${result.rows.length}`);
-  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
-};
-setTimeout(createDefaultUsers, 3000);
-
 // ========== DEBUG ENDPOINTS ==========
 app.get('/api/debug/users', async (req, res) => {
   try {
@@ -380,23 +487,34 @@ app.get('/api/debug/users', async (req, res) => {
   }
 });
 
-app.post('/api/debug/create-admin', async (req, res) => {
-  try {
-    const password_hash = bcrypt.hashSync('admin123', 10);
-    await db.execute({ 
-      sql: `INSERT OR REPLACE INTO users (id, username, password_hash, full_name, role, email) 
-            VALUES (1, 'admin', ?, 'System Admin', 'admin', 'admin@example.com')`, 
-      args: [password_hash] 
-    });
-    res.json({ success: true, message: 'Admin user created/updated' });
-  } catch (err) {
-    res.json({ success: false, error: err.message });
+// ========== CREATE DEFAULT USERS ==========
+const createDefaultUsers = async () => {
+  const defaultUsers = [
+    ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
+    ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
+    ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
+  ];
+  for (const user of defaultUsers) {
+    try {
+      await db.execute({ 
+        sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
+        args: user 
+      });
+      console.log(`✅ User ${user[0]} created/verified`);
+    } catch (err) {
+      console.log(`Error creating user ${user[0]}:`, err.message);
+    }
   }
-});
+  const result = await db.execute('SELECT username FROM users');
+  console.log(`📋 Total users in database: ${result.rows.length}`);
+  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
+};
+setTimeout(createDefaultUsers, 3000);
 
+// ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
-  console.log(`✅ Using Turso cloud database (free, never expires)`);
+  console.log(`✅ Using Turso cloud database`);
   console.log(`📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
