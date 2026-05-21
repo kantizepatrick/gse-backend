@@ -1,18 +1,18 @@
 {
-  "name": "gse-inventory",
+  "name": "gse-inventory-backend",
   "version": "1.0.0",
+  "description": "GSE Spare Parts Inventory Backend",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@libsql/client": "^0.14.0",
     "bcrypt": "^5.1.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
-    "nodemailer": "^6.9.16"
+    "nodemailer": "^6.9.16",
+    "sqlite3": "^5.1.7"
   }
 }
