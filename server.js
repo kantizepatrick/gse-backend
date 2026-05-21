@@ -149,7 +149,7 @@ app.get('/api/parts', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECEIVE PARTS (INCREASES STOCK) ==========
+// ========== RECEIVE PARTS ==========
 app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
   const client = await pool.connect();
@@ -177,7 +177,7 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== ISSUE PARTS (DECREASES STOCK) ==========
+// ========== ISSUE PARTS ==========
 app.post('/api/transactions/issue', authenticateToken, async (req, res) => {
   const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
   const client = await pool.connect();
