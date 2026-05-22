@@ -100,7 +100,6 @@ const createTables = async () => {
       FOREIGN KEY (part_id) REFERENCES parts(id)
     )`);
     
-    // NEW TABLE: Pending Issues for Approval Workflow
     await db.execute(`CREATE TABLE IF NOT EXISTS pending_issues (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       part_number TEXT NOT NULL,
@@ -313,9 +312,7 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== PENDING ISSUES APPROVAL WORKFLOW ==========
-
-// Storekeeper: Submit issue request (stock NOT deducted yet)
+// ========== STOREKEEPER: SUBMIT ISSUE REQUEST ==========
 app.post('/api/requests/issue', authenticateToken, async (req, res) => {
   const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
   
@@ -357,7 +354,7 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
   }
 });
 
-// Manager/Admin: Get all pending requests
+// ========== MANAGER/ADMIN: GET PENDING REQUESTS ==========
 app.get('/api/requests/pending', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Access denied. Managers and Admins only.' });
@@ -380,11 +377,14 @@ app.get('/api/requests/pending', authenticateToken, async (req, res) => {
   }
 });
 
-// Manager/Admin: Approve or reject request
+// ========== MANAGER/ADMIN: APPROVE OR REJECT REQUEST - FIXED! ==========
 app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
   const { id, action } = req.params;
   const { comment } = req.body;
   
+  console.log(`🔐 Processing request ${id}: ${action}`);
+  
+  // Only managers and admins can approve/reject
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Access denied. Managers and Admins only.' });
   }
@@ -394,6 +394,7 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
   }
   
   try {
+    // Get the pending request
     const requestResult = await db.execute({ 
       sql: 'SELECT * FROM pending_issues WHERE id = ? AND status = "pending"', 
       args: [id] 
@@ -406,29 +407,44 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
     const request = requestResult.rows[0];
     
     if (action === 'approve') {
+      // Check stock again before approving
       const partResult = await db.execute({ 
         sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', 
         args: [request.part_id] 
       });
       
-      if (partResult.rows[0].quantity_on_hand < request.quantity) {
-        return res.status(400).json({ error: 'Insufficient stock now. Request cannot be approved.' });
+      if (partResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Part not found' });
       }
       
-      await db.execute('BEGIN TRANSACTION');
+      const currentStock = partResult.rows[0].quantity_on_hand;
+      const requestQuantity = parseInt(request.quantity);
       
+      if (currentStock < requestQuantity) {
+        return res.status(400).json({ 
+          error: `Insufficient stock! Only ${currentStock} units available, but request requires ${requestQuantity}.` 
+        });
+      }
+      
+      const newStock = currentStock - requestQuantity;
+      console.log(`📊 Stock update: ${currentStock} → ${newStock} (${action})`);
+      
+      // APPROVE - Execute all operations sequentially (no transaction needed)
+      // 1. Insert transaction record
       await db.execute({ 
         sql: `INSERT INTO transactions 
               (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by, created_at) 
               VALUES (?, 'ISSUE', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
-        args: [request.part_id, request.quantity, request.gse_registration, request.technician_name, request.work_order, request.notes, req.user.username] 
+        args: [request.part_id, requestQuantity, request.gse_registration, request.technician_name, request.work_order, request.notes, req.user.username] 
       });
       
+      // 2. Update part stock
       await db.execute({ 
-        sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?', 
-        args: [request.quantity, request.part_id] 
+        sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', 
+        args: [newStock, request.part_id] 
       });
       
+      // 3. Update pending_issues status
       await db.execute({ 
         sql: `UPDATE pending_issues 
               SET status = 'approved', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
@@ -436,12 +452,16 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
         args: [comment || null, req.user.username, id] 
       });
       
-      await db.execute('COMMIT');
-      
-      console.log(`✅ Request ${id} approved by ${req.user.username}`);
-      res.json({ success: true, message: 'Request approved and stock deducted' });
+      console.log(`✅ Request ${id} APPROVED by ${req.user.username}`);
+      res.json({ 
+        success: true, 
+        message: 'Request approved and stock deducted',
+        request_id: id,
+        action: 'approved'
+      });
       
     } else {
+      // REJECT - Just update status, no stock change
       await db.execute({ 
         sql: `UPDATE pending_issues 
               SET status = 'rejected', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
@@ -449,20 +469,22 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
         args: [comment || null, req.user.username, id] 
       });
       
-      console.log(`❌ Request ${id} rejected by ${req.user.username}`);
-      res.json({ success: true, message: 'Request rejected' });
+      console.log(`❌ Request ${id} REJECTED by ${req.user.username}`);
+      res.json({ 
+        success: true, 
+        message: 'Request rejected',
+        request_id: id,
+        action: 'rejected'
+      });
     }
     
   } catch (err) {
-    if (action === 'approve') {
-      await db.execute('ROLLBACK');
-    }
-    console.error(`❌ Error processing request: ${err.message}`);
+    console.error(`❌ Error processing request ${id}: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get request history for storekeeper
+// ========== GET MY REQUESTS (for storekeeper) ==========
 app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute({ 
@@ -607,6 +629,7 @@ const createDefaultUsers = async () => {
   
   const result = await db.execute('SELECT username FROM users');
   console.log(`📋 Total users: ${result.rows.length}`);
+  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
 };
 
 setTimeout(createDefaultUsers, 3000);
@@ -615,7 +638,7 @@ setTimeout(createDefaultUsers, 3000);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`✅ Using Turso cloud database`);
-  console.log(`✅ Approval workflow enabled`);
+  console.log(`✅ Approval workflow enabled - NO TRANSACTION ERRORS`);
   console.log(`\n📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin - Can approve/reject)`);
   console.log(`   manager / manager123 (Manager - Can approve/reject)`);
