@@ -40,28 +40,12 @@ const db = createClient({
 
 console.log('✅ Connected to Turso cloud database');
 
-// Email setup
-let emailTransporter = null;
-
-const setupEmail = async () => {
-  try {
-    const testAccount = await nodemailer.createTestAccount();
-    emailTransporter = nodemailer.createTransport({
-      host: 'smtp.ethereal.email',
-      port: 587,
-      secure: false,
-      auth: { user: testAccount.user, pass: testAccount.pass }
-    });
-    console.log('✅ Email system ready');
-  } catch (err) {
-    console.log('⚠️ Email disabled');
-  }
-};
-setupEmail();
-
 // ========== CREATE TABLES ==========
 const createTables = async () => {
   try {
+    // Drop existing tables if needed (for clean slate)
+    // await db.execute(`DROP TABLE IF EXISTS pending_issues`);
+    
     await db.execute(`CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
@@ -277,8 +261,8 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
     
     await db.execute({ 
       sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) 
-            VALUES (?, "RECEIVE", ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
-      args: [part.id, addQuantity, reference_number, notes, req.user.username] 
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+      args: [part.id, 'RECEIVE', addQuantity, reference_number, notes, req.user.username] 
     });
     
     await db.execute({ 
@@ -334,14 +318,14 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient stock available' });
     }
     
-    await db.execute({ 
+    const result = await db.execute({ 
       sql: `INSERT INTO pending_issues 
             (part_number, part_id, quantity, gse_registration, technician_name, work_order, notes, requested_by, requested_by_name, status, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "pending", CURRENT_TIMESTAMP)`, 
-      args: [part_number, part.id, parseInt(quantity), gse_registration, technician_name, work_order, notes, req.user.id, req.user.username] 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+      args: [part_number, part.id, parseInt(quantity), gse_registration, technician_name, work_order, notes, req.user.id, req.user.username, 'pending'] 
     });
     
-    console.log(`✅ Issue request submitted for approval`);
+    console.log(`✅ Issue request submitted for approval, ID: ${result.lastInsertRowid}`);
     
     res.json({ 
       success: true,
@@ -356,11 +340,19 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
 
 // ========== MANAGER/ADMIN: GET PENDING REQUESTS ==========
 app.get('/api/requests/pending', authenticateToken, async (req, res) => {
+  console.log(`🔐 Pending requests accessed by: ${req.user.username}, role: ${req.user.role}`);
+  
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    console.log(`❌ Access denied for ${req.user.username}`);
     return res.status(403).json({ error: 'Access denied. Managers and Admins only.' });
   }
   
   try {
+    // First, check if there are any pending issues
+    const countResult = await db.execute(`SELECT COUNT(*) as count FROM pending_issues WHERE status = 'pending'`);
+    console.log(`📊 Total pending records: ${countResult.rows[0].count}`);
+    
+    // Get all pending requests with part details
     const result = await db.execute(`
       SELECT 
         p.id,
@@ -379,11 +371,11 @@ app.get('/api/requests/pending', authenticateToken, async (req, res) => {
         parts.description
       FROM pending_issues p
       INNER JOIN parts ON p.part_id = parts.id
-      WHERE p.status = "pending"
+      WHERE p.status = 'pending'
       ORDER BY p.created_at DESC
     `);
     
-    console.log(`📋 Found ${result.rows.length} pending requests`);
+    console.log(`✅ Found ${result.rows.length} pending requests`);
     res.json({ success: true, requests: result.rows });
     
   } catch (err) {
@@ -397,7 +389,7 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
   const { id, action } = req.params;
   const { comment } = req.body;
   
-  console.log(`🔐 Processing request ${id}: ${action}`);
+  console.log(`🔐 Processing request ${id}: ${action} by ${req.user.username}`);
   
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Access denied. Managers and Admins only.' });
@@ -439,28 +431,28 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
       }
       
       const newStock = currentStock - requestQuantity;
-      console.log(`📊 Stock update: ${currentStock} → ${newStock} (${action})`);
+      console.log(`📊 Stock update: ${currentStock} → ${newStock}`);
       
-      // 1. Insert transaction record
+      // Insert transaction record
       await db.execute({ 
         sql: `INSERT INTO transactions 
               (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by, created_at) 
-              VALUES (?, "ISSUE", ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
-        args: [request.part_id, requestQuantity, request.gse_registration, request.technician_name, request.work_order, request.notes, req.user.username] 
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+        args: [request.part_id, 'ISSUE', requestQuantity, request.gse_registration, request.technician_name, request.work_order, request.notes, req.user.username] 
       });
       
-      // 2. Update part stock
+      // Update part stock
       await db.execute({ 
         sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', 
         args: [newStock, request.part_id] 
       });
       
-      // 3. Update pending_issues status
+      // Update pending_issues status
       await db.execute({ 
         sql: `UPDATE pending_issues 
-              SET status = "approved", admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
+              SET status = ?, admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
               WHERE id = ?`, 
-        args: [comment || null, req.user.username, id] 
+        args: ['approved', comment || null, req.user.username, id] 
       });
       
       console.log(`✅ Request ${id} APPROVED by ${req.user.username}`);
@@ -474,9 +466,9 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
     } else {
       await db.execute({ 
         sql: `UPDATE pending_issues 
-              SET status = "rejected", admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
+              SET status = ?, admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
               WHERE id = ?`, 
-        args: [comment || null, req.user.username, id] 
+        args: ['rejected', comment || null, req.user.username, id] 
       });
       
       console.log(`❌ Request ${id} REJECTED by ${req.user.username}`);
@@ -496,6 +488,8 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
 
 // ========== GET MY REQUESTS (for storekeeper) ==========
 app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
+  console.log(`📋 My requests accessed by: ${req.user.username}`);
+  
   try {
     const result = await db.execute({ 
       sql: `SELECT p.*, parts.description 
@@ -507,6 +501,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
       args: [req.user.id] 
     });
     
+    console.log(`✅ Found ${result.rows.length} requests for user`);
     res.json({ success: true, requests: result.rows });
   } catch (err) {
     console.error(`❌ Error fetching my requests: ${err.message}`);
@@ -643,6 +638,15 @@ app.get('/api/debug/users', async (req, res) => {
   }
 });
 
+app.get('/api/debug/pending-count', async (req, res) => {
+  try {
+    const result = await db.execute('SELECT COUNT(*) as count FROM pending_issues');
+    res.json({ count: result.rows[0].count });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // ========== CREATE DEFAULT USERS ==========
 const createDefaultUsers = async () => {
   const defaultUsers = [
@@ -657,15 +661,17 @@ const createDefaultUsers = async () => {
       if (check.rows.length === 0) {
         await db.execute({ sql: `INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, args: user });
         console.log(`✅ Created user: ${user[0]}`);
+      } else {
+        console.log(`✅ User already exists: ${user[0]}`);
       }
     } catch (err) {
       console.log(`Error with user ${user[0]}:`, err.message);
     }
   }
   
-  const result = await db.execute('SELECT username FROM users');
+  const result = await db.execute('SELECT username, role FROM users');
   console.log(`📋 Total users: ${result.rows.length}`);
-  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
+  console.log(`📋 Users: ${result.rows.map(u => `${u.username} (${u.role})`).join(', ')}`);
 };
 
 setTimeout(createDefaultUsers, 3000);
@@ -674,7 +680,7 @@ setTimeout(createDefaultUsers, 3000);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`✅ Using Turso cloud database`);
-  console.log(`✅ Approval workflow enabled - SQL quotes fixed`);
+  console.log(`✅ Approval workflow enabled`);
   console.log(`\n📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin - Can approve/reject)`);
   console.log(`   manager / manager123 (Manager - Can approve/reject)`);
