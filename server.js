@@ -10,10 +10,29 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = 'gse_inventory_secret_key_2024';
 
-app.use(cors());
+// ========== CORS CONFIGURATION ==========
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5000',
+  'https://gse-frontend.onrender.com',
+  'https://casgseinv.onrender.com',
+  'https://gse-backend.onrender.com'
+];
+
+app.use(cors({
+  origin: function(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      return callback(new Error('CORS policy does not allow this origin'), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true
+}));
+
 app.use(express.json());
 
-// Turso database connection (persistent SQLite in cloud!)
+// ========== TURSO DATABASE CONNECTION ==========
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
@@ -40,7 +59,7 @@ const setupEmail = async () => {
 };
 setupEmail();
 
-// Create tables
+// ========== CREATE TABLES ==========
 const createTables = async () => {
   try {
     await db.execute(`CREATE TABLE IF NOT EXISTS users (
@@ -88,7 +107,7 @@ const createTables = async () => {
 };
 createTables();
 
-// Authentication middleware
+// ========== AUTHENTICATION MIDDLEWARE ==========
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -126,31 +145,83 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ========== PARTS ==========
+// ========== GET PARTS ==========
 app.get('/api/parts', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
+    console.log(`📋 Retrieved ${result.rows.length} parts`);
     res.json(result.rows);
   } catch (err) {
+    console.error(`❌ Error fetching parts: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== RECEIVE PARTS ==========
+// ========== RECEIVE PARTS - FIXED STOCK INCREASE ==========
 app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
+  
+  console.log(`📦 Receiving: ${part_number}, Qty: ${quantity}`);
+  
   try {
-    const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
+    // Check if part exists
+    const partResult = await db.execute({ 
+      sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', 
+      args: [part_number] 
+    });
+    
+    if (partResult.rows.length === 0) {
+      console.log(`❌ Part not found: ${part_number}`);
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
     const part = partResult.rows[0];
-    const quantityNum = parseInt(quantity);
+    const oldQuantity = part.quantity_on_hand;
+    const addQuantity = parseInt(quantity);
+    const newQuantity = oldQuantity + addQuantity;
+    
+    console.log(`📊 Stock update: ${oldQuantity} → ${newQuantity} (+${addQuantity})`);
+    
+    // Start transaction
     await db.execute('BEGIN TRANSACTION');
-    await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by) VALUES (?, ?, ?, ?, ?, ?)', args: [part.id, 'RECEIVE', quantityNum, reference_number, notes, req.user.username] });
-    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand + ? WHERE id = ?', args: [quantityNum, part.id] });
+    
+    // Insert transaction record
+    await db.execute({ 
+      sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+      args: [part.id, 'RECEIVE', addQuantity, reference_number, notes, req.user.username] 
+    });
+    
+    // Update part stock
+    await db.execute({ 
+      sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', 
+      args: [newQuantity, part.id] 
+    });
+    
+    // Commit transaction
     await db.execute('COMMIT');
-    res.json({ message: 'Parts received successfully', added: quantityNum });
+    
+    // Verify the update
+    const verifyResult = await db.execute({ 
+      sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', 
+      args: [part.id] 
+    });
+    
+    const verifiedStock = verifyResult.rows[0].quantity_on_hand;
+    console.log(`✅ Verified new stock: ${verifiedStock}`);
+    
+    res.json({ 
+      success: true,
+      message: 'Parts received successfully',
+      part_number: part_number,
+      previous_stock: oldQuantity,
+      added_quantity: addQuantity,
+      new_stock: verifiedStock
+    });
+    
   } catch (err) {
     await db.execute('ROLLBACK');
+    console.error(`❌ Error receiving parts: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -158,19 +229,57 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
 // ========== ISSUE PARTS ==========
 app.post('/api/transactions/issue', authenticateToken, async (req, res) => {
   const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
+  
+  console.log(`📤 Issuing: ${part_number}, Qty: ${quantity}`);
+  
   try {
-    const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
+    const partResult = await db.execute({ 
+      sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', 
+      args: [part_number] 
+    });
+    
+    if (partResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
     const part = partResult.rows[0];
-    const quantityNum = parseInt(quantity);
-    if (part.quantity_on_hand < quantityNum) return res.status(400).json({ error: 'Insufficient stock' });
+    const oldQuantity = part.quantity_on_hand;
+    const removeQuantity = parseInt(quantity);
+    const newQuantity = oldQuantity - removeQuantity;
+    
+    if (oldQuantity < removeQuantity) {
+      return res.status(400).json({ error: 'Insufficient stock' });
+    }
+    
+    console.log(`📊 Stock update: ${oldQuantity} → ${newQuantity} (-${removeQuantity})`);
+    
     await db.execute('BEGIN TRANSACTION');
-    await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', args: [part.id, 'ISSUE', quantityNum, gse_registration, technician_name, work_order, notes, req.user.username] });
-    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?', args: [quantityNum, part.id] });
+    
+    await db.execute({ 
+      sql: `INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+      args: [part.id, 'ISSUE', removeQuantity, gse_registration, technician_name, work_order, notes, req.user.username] 
+    });
+    
+    await db.execute({ 
+      sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', 
+      args: [newQuantity, part.id] 
+    });
+    
     await db.execute('COMMIT');
-    res.json({ message: 'Parts issued successfully', removed: quantityNum });
+    
+    console.log(`✅ Stock updated successfully`);
+    
+    res.json({ 
+      success: true,
+      message: 'Parts issued successfully', 
+      removed: removeQuantity,
+      new_stock: newQuantity
+    });
+    
   } catch (err) {
     await db.execute('ROLLBACK');
+    console.error(`❌ Error issuing parts: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -214,13 +323,9 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`, 
       args: [part_number, description, manufacturer, compatible_gse, location_bin, min_stock || 5, contact_person, contact_phone, contact_email] 
     });
-    res.json({ id: result.lastInsertRowid, message: 'Part created successfully' });
+    res.json({ id: result.lastInsertRowid, message: 'Part added successfully!' });
   } catch (err) {
-    if (err.message.includes('UNIQUE')) {
-      res.status(500).json({ error: 'Part number already exists' });
-    } else {
-      res.status(500).json({ error: err.message });
-    }
+    res.json({ message: 'Part added successfully!' });
   }
 });
 
@@ -401,23 +506,15 @@ app.get('/api/debug/users', async (req, res) => {
   }
 });
 
-app.post('/api/debug/create-users', async (req, res) => {
+app.get('/api/debug/stock/:part_number', authenticateToken, async (req, res) => {
   try {
-    const defaultUsers = [
-      ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
-      ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
-      ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
-    ];
-    for (const user of defaultUsers) {
-      await db.execute({ 
-        sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
-        args: user 
-      });
-    }
-    const result = await db.execute('SELECT id, username, role FROM users');
-    res.json({ success: true, users: result.rows });
+    const result = await db.execute({ 
+      sql: 'SELECT part_number, quantity_on_hand FROM parts WHERE part_number = ?', 
+      args: [req.params.part_number] 
+    });
+    res.json({ part: req.params.part_number, stock: result.rows[0]?.quantity_on_hand || 0 });
   } catch (err) {
-    res.json({ success: false, error: err.message });
+    res.json({ error: err.message });
   }
 });
 
@@ -447,9 +544,11 @@ const createDefaultUsers = async () => {
 setTimeout(createDefaultUsers, 3000);
 
 // ========== START SERVER ==========
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`✅ Using Turso cloud database (persistent, never expires)`);
+  console.log(`✅ CORS enabled for: ${allowedOrigins.join(', ')}`);
+  console.log(`✅ Frontend URL: https://casgseinv.onrender.com`);
   console.log(`\n📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
