@@ -1,50 +1,110 @@
 const express = require('express');
-const { createClient } = require('@libsql/client');
+const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = 'gse_inventory_secret_key_2024';
 
-app.use(cors());
+// ========== CORS CONFIGURATION ==========
+// Allow both old and new frontend URLs
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5000',
+  'https://gse-frontend.onrender.com',
+  'https://casgseinv.onrender.com',
+  'https://gse-backend.onrender.com'
+];
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true
+}));
+
 app.use(express.json());
 
-// Turso database connection
-const db = createClient({
-  url: process.env.TURSO_DATABASE_URL || 'libsql://gse-inventory-kantizepatrick.aws-eu-west-1.turso.io',
-  authToken: process.env.TURSO_AUTH_TOKEN || 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3NzkxOTgwOTcsImlkIjoiMDE5ZTQwNzYtNWMwMS03ODIwLWE5NzQtNWQ5OTI4MzE1M2NlIiwicmlkIjoiMGQzZTI2MDQtODg3OC00OTdmLThiMDktZmI2YWY2MWExNzMxIn0.7aqL_8q0hK-ZCgf8IJt0TPrQUI6kQU-ddPIK7lDGB_VeXzJNVU35XUzGaz2ffrQ4z213zFQrOQUIHrlu5jPbDw'
+// ========== GMAIL EMAIL CONFIGURATION ==========
+// REPLACE WITH YOUR ACTUAL GMAIL CREDENTIALS
+const emailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: 'your-email@gmail.com',     // <-- REPLACE with your Gmail address
+    pass: 'your-app-password'          // <-- REPLACE with your Gmail App Password
+  }
 });
 
-console.log('✅ Connected to Turso cloud database');
-
-// Email setup
-let emailTransporter = null;
-
-const setupEmail = async () => {
-  try {
-    const testAccount = await nodemailer.createTestAccount();
-    emailTransporter = nodemailer.createTransport({
-      host: 'smtp.ethereal.email',
-      port: 587,
-      secure: false,
-      auth: { user: testAccount.user, pass: testAccount.pass }
-    });
-    console.log('✅ Email system ready');
-  } catch (err) {
-    console.log('⚠️ Email disabled');
+// Verify email configuration on startup
+emailTransporter.verify((error, success) => {
+  if (error) {
+    console.log('❌ Email configuration error:');
+    console.log('   Please check your Gmail credentials in server.js');
+    console.log('   Reset codes will still appear in console.');
+  } else {
+    console.log('✅ Gmail configured successfully!');
+    console.log('   Password reset emails will be sent to users.');
   }
-};
-setupEmail();
+});
+
+const db = new sqlite3.Database('./gse_inventory.db');
+
+// Create tables
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    full_name TEXT,
+    role TEXT DEFAULT 'storekeeper',
+    email TEXT
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    part_number TEXT UNIQUE NOT NULL,
+    description TEXT,
+    manufacturer TEXT,
+    compatible_gse TEXT,
+    location_bin TEXT,
+    quantity_on_hand INTEGER DEFAULT 0,
+    min_stock INTEGER DEFAULT 5,
+    contact_person TEXT,
+    contact_phone TEXT,
+    contact_email TEXT
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    part_id INTEGER,
+    transaction_type TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    gse_registration TEXT,
+    technician_name TEXT,
+    work_order TEXT,
+    reference_number TEXT,
+    created_by TEXT,
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+});
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
+  
   if (!token) return res.status(401).json({ error: 'Access denied' });
+  
   jwt.verify(token, SECRET_KEY, (err, user) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
     req.user = user;
@@ -53,306 +113,307 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ========== LOGIN ==========
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
-  console.log(`Login attempt: ${username}`);
-  try {
-    const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
-    if (result.rows.length === 0) {
-      console.log(`User not found: ${username}`);
+  
+  db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
+    if (err || !user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    const user = result.rows[0];
-    console.log(`User found: ${username}, role: ${user.role}`);
+    
     if (bcrypt.compareSync(password, user.password_hash)) {
       const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
-      console.log(`Login successful: ${username}`);
       res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } });
     } else {
-      console.log(`Invalid password for: ${username}`);
       res.status(401).json({ error: 'Invalid credentials' });
     }
-  } catch (err) {
-    console.error('Login error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
-// ========== PARTS ==========
-app.get('/api/parts', authenticateToken, async (req, res) => {
-  try {
-    const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ========== PARTS MANAGEMENT ==========
+app.get('/api/parts', authenticateToken, (req, res) => {
+  db.all('SELECT * FROM parts ORDER BY part_number', [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
 });
 
-// ========== RECEIVE PARTS (INCREASES STOCK) ==========
-app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
+app.post('/api/transactions/receive', authenticateToken, (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
-  console.log(`📦 RECEIVE: ${part_number}, Qty: ${quantity}`);
-  try {
-    const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
-    const part = partResult.rows[0];
-    const quantityNum = parseInt(quantity);
-    await db.execute('BEGIN TRANSACTION');
-    await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by) VALUES (?, ?, ?, ?, ?, ?)', args: [part.id, 'RECEIVE', quantityNum, reference_number, notes, req.user.username] });
-    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand + ? WHERE id = ?', args: [quantityNum, part.id] });
-    await db.execute('COMMIT');
-    console.log(`✅ Stock increased by ${quantityNum}`);
-    res.json({ message: 'Parts received successfully', added: quantityNum });
-  } catch (err) {
-    await db.execute('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== ISSUE PARTS (DECREASES STOCK) ==========
-app.post('/api/transactions/issue', authenticateToken, async (req, res) => {
-  const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
-  console.log(`📤 ISSUE: ${part_number}, Qty: ${quantity}`);
-  try {
-    const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
-    const part = partResult.rows[0];
-    const quantityNum = parseInt(quantity);
-    if (part.quantity_on_hand < quantityNum) return res.status(400).json({ error: 'Insufficient stock' });
-    await db.execute('BEGIN TRANSACTION');
-    await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', args: [part.id, 'ISSUE', quantityNum, gse_registration, technician_name, work_order, notes, req.user.username] });
-    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?', args: [quantityNum, part.id] });
-    await db.execute('COMMIT');
-    console.log(`✅ Stock decreased by ${quantityNum}`);
-    res.json({ message: 'Parts issued successfully', removed: quantityNum });
-  } catch (err) {
-    await db.execute('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== GET TRANSACTIONS ==========
-app.get('/api/transactions', authenticateToken, async (req, res) => {
-  try {
-    const result = await db.execute(`
-      SELECT t.*, p.part_number, p.description 
-      FROM transactions t 
-      JOIN parts p ON t.part_id = p.id 
-      ORDER BY t.created_at DESC 
-      LIMIT 50
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== LOW STOCK REPORT ==========
-app.get('/api/reports/low-stock', authenticateToken, async (req, res) => {
-  try {
-    const result = await db.execute(`
-      SELECT part_number, description, quantity_on_hand, min_stock, location_bin 
-      FROM parts 
-      WHERE quantity_on_hand <= min_stock
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== CREATE PART ==========
-app.post('/api/parts', authenticateToken, async (req, res) => {
-  const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, contact_person, contact_phone, contact_email } = req.body;
-  try {
-    const result = await db.execute({ 
-      sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, contact_person, contact_phone, contact_email) 
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`, 
-      args: [part_number, description, manufacturer, compatible_gse, location_bin, min_stock || 5, contact_person, contact_phone, contact_email] 
+  
+  db.get('SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', [part_number], (err, part) => {
+    if (err || !part) {
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      db.run(`INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by) VALUES (?, ?, ?, ?, ?, ?)`, [part.id, 'RECEIVE', quantity, reference_number, notes, req.user.username]);
+      db.run(`UPDATE parts SET quantity_on_hand = quantity_on_hand + ? WHERE id = ?`, [quantity, part.id]);
+      db.run('COMMIT', (err) => {
+        if (err) { db.run('ROLLBACK'); return res.status(500).json({ error: err.message }); }
+        res.json({ message: 'Parts received successfully' });
+      });
     });
-    res.json({ id: result.lastInsertRowid, message: 'Part created successfully' });
-  } catch (err) {
-    res.status(500).json({ error: 'Part number already exists' });
-  }
+  });
+});
+
+app.post('/api/transactions/issue', authenticateToken, (req, res) => {
+  const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
+  
+  db.get('SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', [part_number], (err, part) => {
+    if (err || !part) return res.status(404).json({ error: 'Part not found' });
+    if (part.quantity_on_hand < quantity) return res.status(400).json({ error: 'Insufficient stock' });
+    
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      db.run(`INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [part.id, 'ISSUE', quantity, gse_registration, technician_name, work_order, notes, req.user.username]);
+      db.run(`UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?`, [quantity, part.id]);
+      db.run('COMMIT', (err) => {
+        if (err) { db.run('ROLLBACK'); return res.status(500).json({ error: err.message }); }
+        res.json({ message: 'Parts issued successfully' });
+      });
+    });
+  });
+});
+
+app.get('/api/transactions', authenticateToken, (req, res) => {
+  db.all(`SELECT t.*, p.part_number, p.description FROM transactions t JOIN parts p ON t.part_id = p.id ORDER BY t.created_at DESC LIMIT 50`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.get('/api/reports/low-stock', authenticateToken, (req, res) => {
+  db.all(`SELECT part_number, description, quantity_on_hand, min_stock, location_bin FROM parts WHERE quantity_on_hand <= min_stock`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+// ========== CREATE PART - WITH CONTACT DETAILS ==========
+app.post('/api/parts', authenticateToken, (req, res) => {
+  const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, contact_person, contact_phone, contact_email } = req.body;
+  
+  db.run(`INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, contact_person, contact_phone, contact_email)
+          VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+    [part_number, description, manufacturer, compatible_gse, location_bin, min_stock || 5, contact_person, contact_phone, contact_email],
+    function(err) {
+      if (err) return res.status(500).json({ error: 'Part number already exists' });
+      res.json({ id: this.lastID, message: 'Part created successfully' });
+    }
+  );
 });
 
 // ========== UPDATE PART ==========
-app.put('/api/parts/:id', authenticateToken, async (req, res) => {
+app.put('/api/parts/:id', authenticateToken, (req, res) => {
   const { contact_person, contact_phone, contact_email, location_bin, min_stock } = req.body;
-  try {
-    await db.execute({ 
-      sql: `UPDATE parts SET contact_person = ?, contact_phone = ?, contact_email = ?, location_bin = ?, min_stock = ? WHERE id = ?`, 
-      args: [contact_person, contact_phone, contact_email, location_bin, min_stock, req.params.id] 
-    });
-    res.json({ message: 'Part updated successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  
+  db.run(`UPDATE parts SET 
+          contact_person = ?, 
+          contact_phone = ?, 
+          contact_email = ?, 
+          location_bin = ?,
+          min_stock = ?
+          WHERE id = ?`,
+    [contact_person, contact_phone, contact_email, location_bin, min_stock, req.params.id],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Part updated successfully' });
+    }
+  );
 });
 
-// ========== DELETE PART ==========
-app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
+app.delete('/api/parts/:id', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager only' });
   }
-  try {
-    await db.execute({ sql: 'DELETE FROM parts WHERE id = ?', args: [req.params.id] });
+  db.run('DELETE FROM parts WHERE id = ?', [req.params.id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Part deleted successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // ========== USER MANAGEMENT ==========
-app.get('/api/users', authenticateToken, async (req, res) => {
+app.get('/api/users', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  try {
-    const result = await db.execute('SELECT id, username, full_name, role, email FROM users');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  db.all('SELECT id, username, full_name, role, email FROM users', [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
 });
 
-app.post('/api/users', authenticateToken, async (req, res) => {
+app.post('/api/users', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { username, password, full_name, role, email } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
   const password_hash = bcrypt.hashSync(password, 10);
-  try {
-    const result = await db.execute({ 
-      sql: `INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
-      args: [username, password_hash, full_name, role || 'storekeeper', email || null] 
-    });
-    res.json({ id: result.lastInsertRowid, message: 'User created successfully' });
-  } catch (err) {
-    res.status(500).json({ error: 'Username already exists' });
-  }
+  db.run(`INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, [username, password_hash, full_name, role || 'storekeeper', email || null], function(err) {
+    if (err) return res.status(500).json({ error: 'Username already exists' });
+    res.json({ id: this.lastID, message: 'User created successfully' });
+  });
 });
 
-app.put('/api/users/:id', authenticateToken, async (req, res) => {
+app.put('/api/users/:id', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { full_name, role, email } = req.body;
-  try {
-    await db.execute({ 
-      sql: 'UPDATE users SET full_name = ?, role = ?, email = ? WHERE id = ?', 
-      args: [full_name, role, email, req.params.id] 
-    });
+  db.run('UPDATE users SET full_name = ?, role = ?, email = ? WHERE id = ?', [full_name, role, email, req.params.id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'User updated successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
-app.delete('/api/users/:id', authenticateToken, async (req, res) => {
+app.delete('/api/users/:id', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   if (req.params.id == req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
-  try {
-    await db.execute({ sql: 'DELETE FROM users WHERE id = ?', args: [req.params.id] });
+  db.run('DELETE FROM users WHERE id = ?', [req.params.id], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'User deleted successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // ========== PASSWORD MANAGEMENT ==========
-app.post('/api/change-password', authenticateToken, async (req, res) => {
+app.post('/api/change-password', authenticateToken, (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password) return res.status(400).json({ error: 'Current and new password required' });
   if (new_password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-  try {
-    const result = await db.execute({ sql: 'SELECT password_hash FROM users WHERE id = ?', args: [req.user.id] });
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    if (!bcrypt.compareSync(current_password, result.rows[0].password_hash)) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
-    }
+  
+  db.get('SELECT password_hash FROM users WHERE id = ?', [req.user.id], (err, user) => {
+    if (err || !user) return res.status(404).json({ error: 'User not found' });
+    if (!bcrypt.compareSync(current_password, user.password_hash)) return res.status(401).json({ error: 'Current password is incorrect' });
+    
     const new_hash = bcrypt.hashSync(new_password, 10);
-    await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [new_hash, req.user.id] });
-    res.json({ message: 'Password changed successfully! Please login again.' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update password' });
-  }
+    db.run('UPDATE users SET password_hash = ? WHERE id = ?', [new_hash, req.user.id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to update password' });
+      res.json({ message: 'Password changed successfully! Please login again.' });
+    });
+  });
 });
 
-app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
+app.post('/api/admin/reset-password', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { user_id, new_password } = req.body;
   if (!user_id || !new_password) return res.status(400).json({ error: 'User ID and new password required' });
   if (new_password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  
   const new_hash = bcrypt.hashSync(new_password, 10);
-  try {
-    await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [new_hash, user_id] });
+  db.run('UPDATE users SET password_hash = ? WHERE id = ?', [new_hash, user_id], function(err) {
+    if (err) return res.status(500).json({ error: 'Failed to reset password' });
     res.json({ message: 'Password reset successfully!' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to reset password' });
-  }
+  });
 });
 
-// ========== FORGOT PASSWORD ==========
+// ========== FORGOT PASSWORD WITH GMAIL ==========
 const resetCodes = new Map();
 
-app.post('/api/forgot-password', async (req, res) => {
+app.post('/api/forgot-password', (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'Username is required' });
-  try {
-    const result = await db.execute({ sql: 'SELECT id, username, email FROM users WHERE username = ?', args: [username] });
-    if (result.rows.length === 0) {
+  
+  db.get('SELECT id, username, email FROM users WHERE username = ?', [username], (err, user) => {
+    if (err || !user) {
       return res.json({ message: 'If account exists, reset code has been sent.' });
     }
-    const user = result.rows[0];
+    
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
     resetCodes.set(user.username, { code: resetCode, expires: Date.now() + 3600000 });
-    console.log(`\n🔐 RESET CODE FOR ${username}: ${resetCode}`);
-    if (user.email && emailTransporter) {
-      emailTransporter.sendMail({
-        from: '"GSE Inventory" <noreply@gse.com>',
+    
+    if (user.email) {
+      const mailOptions = {
+        from: '"GSE Inventory System" <your-email@gmail.com>',
         to: user.email,
-        subject: 'Password Reset Code',
-        html: `<h2>Your Reset Code: ${resetCode}</h2><p>Expires in 1 hour.</p>`
-      }, (err) => {
-        if (err) console.log(`❌ Email error: ${err.message}`);
-        else console.log(`✅ Email sent to ${user.email}`);
+        subject: '🔐 Password Reset Code - GSE Inventory',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
+            <h2 style="color: #2c3e50; text-align: center;">GSE Spare Parts Inventory</h2>
+            <hr>
+            <p>Hello <strong>${username}</strong>,</p>
+            <p>You requested to reset your password. Use the code below:</p>
+            <div style="background-color: #f0f0f0; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 5px; border-radius: 5px;">
+              ${resetCode}
+            </div>
+            <p>This code will expire in <strong>1 hour</strong>.</p>
+            <p>If you didn't request this, please ignore this email.</p>
+            <hr>
+            <p style="font-size: 12px; color: #666;">GSE Inventory System</p>
+          </div>
+        `
+      };
+      
+      emailTransporter.sendMail(mailOptions, (emailErr, info) => {
+        if (emailErr) {
+          console.log('❌ Gmail error:', emailErr.message);
+          console.log('========================================');
+          console.log(`🔐 RESET CODE FOR ${username}: ${resetCode}`);
+          console.log('========================================');
+        } else {
+          console.log(`✅ Password reset email sent to ${user.email}`);
+          console.log('========================================');
+          console.log(`🔐 RESET CODE FOR ${username}: ${resetCode}`);
+          console.log('========================================');
+        }
       });
+    } else {
+      console.log('========================================');
+      console.log(`🔐 RESET CODE FOR ${username}: ${resetCode}`);
+      console.log('========================================');
+      console.log(`⚠️ No email configured for ${username}. Add email via Users page.`);
     }
-    res.json({ message: 'Reset code sent!' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    
+    res.json({ message: 'Reset code sent to your email!' });
+  });
 });
 
-app.post('/api/reset-password', async (req, res) => {
+app.post('/api/reset-password', (req, res) => {
   const { username, reset_code, new_password } = req.body;
   if (!username || !reset_code || !new_password) return res.status(400).json({ error: 'All fields required' });
   if (new_password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  
   const stored = resetCodes.get(username);
   if (!stored || stored.code !== reset_code) return res.status(400).json({ error: 'Invalid reset code' });
   if (Date.now() > stored.expires) return res.status(400).json({ error: 'Reset code expired' });
+  
   const new_hash = bcrypt.hashSync(new_password, 10);
-  try {
-    await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE username = ?', args: [new_hash, username] });
+  db.run('UPDATE users SET password_hash = ? WHERE username = ?', [new_hash, username], function(err) {
+    if (err) return res.status(500).json({ error: 'Failed to reset password' });
     resetCodes.delete(username);
     res.json({ message: 'Password reset successfully!' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to reset password' });
-  }
+  });
 });
 
 // ========== DEBUG ENDPOINTS ==========
-app.get('/api/debug/users', async (req, res) => {
-  try {
-    const result = await db.execute('SELECT id, username, role FROM users');
-    res.json({ success: true, count: result.rows.length, users: result.rows });
-  } catch (err) {
-    res.json({ success: false, error: err.message });
-  }
+app.get('/api/debug/users', (req, res) => {
+  db.all('SELECT id, username, role FROM users', [], (err, rows) => {
+    if (err) res.json({ success: false, error: err.message });
+    else res.json({ success: true, count: rows.length, users: rows });
+  });
 });
 
-// ========== START SERVER ==========
+// Create default users
+const createDefaultUsers = () => {
+  const defaultUsers = [
+    ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
+    ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
+    ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
+  ];
+  defaultUsers.forEach(user => {
+    db.run(`INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, user);
+  });
+};
+createDefaultUsers();
+
 app.listen(PORT, () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
-  console.log(`✅ Using Turso cloud database (data persists forever!)`);
-  console.log(`\n📋 Default Logins:`);
-  console.log(`   admin / admin123 (Admin)`);
-  console.log(`   manager / manager123 (Manager)`);
-  console.log(`   storekeeper / keeper123 (Storekeeper)`);
+  console.log(`✅ CORS enabled for: ${allowedOrigins.join(', ')}`);
+  console.log(`✅ Login at https://casgseinv.onrender.com`);
+  console.log('');
+  console.log('📧 GMAIL SETUP INSTRUCTIONS:');
+  console.log('1. Go to server.js and replace:');
+  console.log('   - your-email@gmail.com with YOUR Gmail');
+  console.log('   - your-app-password with Gmail App Password');
+  console.log('2. To get App Password:');
+  console.log('   - Enable 2-Factor Authentication on Gmail');
+  console.log('   - Go to Security → App Passwords');
+  console.log('   - Generate password for "Mail"');
+  console.log('');
 });
