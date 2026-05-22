@@ -277,8 +277,8 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
     
     await db.execute({ 
       sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
-      args: [part.id, 'RECEIVE', addQuantity, reference_number, notes, req.user.username] 
+            VALUES (?, "RECEIVE", ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+      args: [part.id, addQuantity, reference_number, notes, req.user.username] 
     });
     
     await db.execute({ 
@@ -337,7 +337,7 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
     await db.execute({ 
       sql: `INSERT INTO pending_issues 
             (part_number, part_id, quantity, gse_registration, technician_name, work_order, notes, requested_by, requested_by_name, status, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)`, 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "pending", CURRENT_TIMESTAMP)`, 
       args: [part_number, part.id, parseInt(quantity), gse_registration, technician_name, work_order, notes, req.user.id, req.user.username] 
     });
     
@@ -362,29 +362,43 @@ app.get('/api/requests/pending', authenticateToken, async (req, res) => {
   
   try {
     const result = await db.execute(`
-      SELECT p.*, 
-             parts.quantity_on_hand as current_stock,
-             parts.description
+      SELECT 
+        p.id,
+        p.part_number,
+        p.quantity,
+        p.gse_registration,
+        p.technician_name,
+        p.work_order,
+        p.notes,
+        p.requested_by,
+        p.requested_by_name,
+        p.status,
+        p.admin_comment,
+        p.created_at,
+        parts.quantity_on_hand as current_stock,
+        parts.description
       FROM pending_issues p
-      JOIN parts ON p.part_id = parts.id
-      WHERE p.status = 'pending'
+      INNER JOIN parts ON p.part_id = parts.id
+      WHERE p.status = "pending"
       ORDER BY p.created_at DESC
     `);
     
+    console.log(`📋 Found ${result.rows.length} pending requests`);
     res.json({ success: true, requests: result.rows });
+    
   } catch (err) {
+    console.error(`❌ Error fetching pending requests: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== MANAGER/ADMIN: APPROVE OR REJECT REQUEST - FIXED! ==========
+// ========== MANAGER/ADMIN: APPROVE OR REJECT REQUEST ==========
 app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
   const { id, action } = req.params;
   const { comment } = req.body;
   
   console.log(`🔐 Processing request ${id}: ${action}`);
   
-  // Only managers and admins can approve/reject
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Access denied. Managers and Admins only.' });
   }
@@ -394,7 +408,6 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
   }
   
   try {
-    // Get the pending request
     const requestResult = await db.execute({ 
       sql: 'SELECT * FROM pending_issues WHERE id = ? AND status = "pending"', 
       args: [id] 
@@ -407,7 +420,6 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
     const request = requestResult.rows[0];
     
     if (action === 'approve') {
-      // Check stock again before approving
       const partResult = await db.execute({ 
         sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', 
         args: [request.part_id] 
@@ -429,12 +441,11 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
       const newStock = currentStock - requestQuantity;
       console.log(`📊 Stock update: ${currentStock} → ${newStock} (${action})`);
       
-      // APPROVE - Execute all operations sequentially (no transaction needed)
       // 1. Insert transaction record
       await db.execute({ 
         sql: `INSERT INTO transactions 
               (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by, created_at) 
-              VALUES (?, 'ISSUE', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
+              VALUES (?, "ISSUE", ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
         args: [request.part_id, requestQuantity, request.gse_registration, request.technician_name, request.work_order, request.notes, req.user.username] 
       });
       
@@ -447,7 +458,7 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
       // 3. Update pending_issues status
       await db.execute({ 
         sql: `UPDATE pending_issues 
-              SET status = 'approved', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
+              SET status = "approved", admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
               WHERE id = ?`, 
         args: [comment || null, req.user.username, id] 
       });
@@ -461,10 +472,9 @@ app.post('/api/requests/:id/:action', authenticateToken, async (req, res) => {
       });
       
     } else {
-      // REJECT - Just update status, no stock change
       await db.execute({ 
         sql: `UPDATE pending_issues 
-              SET status = 'rejected', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
+              SET status = "rejected", admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP 
               WHERE id = ?`, 
         args: [comment || null, req.user.username, id] 
       });
@@ -499,6 +509,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
     
     res.json({ success: true, requests: result.rows });
   } catch (err) {
+    console.error(`❌ Error fetching my requests: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -575,6 +586,31 @@ app.post('/api/users', authenticateToken, async (req, res) => {
   }
 });
 
+app.put('/api/users/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { full_name, role, email } = req.body;
+  try {
+    await db.execute({ 
+      sql: 'UPDATE users SET full_name = ?, role = ?, email = ? WHERE id = ?', 
+      args: [full_name, role, email, req.params.id] 
+    });
+    res.json({ message: 'User updated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/users/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (req.params.id == req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
+  try {
+    await db.execute({ sql: 'DELETE FROM users WHERE id = ?', args: [req.params.id] });
+    res.json({ message: 'User deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== CHANGE PASSWORD ==========
 app.post('/api/change-password', authenticateToken, async (req, res) => {
   const { current_password, new_password } = req.body;
@@ -638,7 +674,7 @@ setTimeout(createDefaultUsers, 3000);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`✅ Using Turso cloud database`);
-  console.log(`✅ Approval workflow enabled - NO TRANSACTION ERRORS`);
+  console.log(`✅ Approval workflow enabled - SQL quotes fixed`);
   console.log(`\n📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin - Can approve/reject)`);
   console.log(`   manager / manager123 (Manager - Can approve/reject)`);
