@@ -119,22 +119,137 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// ========== INITIALIZE USERS ENDPOINT (CALL THIS FIRST) ==========
+app.post('/api/init-users', async (req, res) => {
+  try {
+    console.log('🔧 Initializing default users...');
+    
+    const defaultUsers = [
+      ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
+      ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
+      ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
+    ];
+    
+    let created = 0;
+    let existing = 0;
+    
+    for (const user of defaultUsers) {
+      try {
+        const check = await db.execute({ 
+          sql: 'SELECT id FROM users WHERE username = ?', 
+          args: [user[0]] 
+        });
+        
+        if (check.rows.length === 0) {
+          await db.execute({ 
+            sql: `INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
+            args: user 
+          });
+          console.log(`✅ Created user: ${user[0]}`);
+          created++;
+        } else {
+          console.log(`✅ User already exists: ${user[0]}`);
+          existing++;
+        }
+      } catch (err) {
+        console.log(`❌ Error with user ${user[0]}:`, err.message);
+      }
+    }
+    
+    const result = await db.execute('SELECT id, username, role FROM users');
+    console.log(`📋 Total users in database: ${result.rows.length}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Users initialized',
+      created: created,
+      existing: existing,
+      total_users: result.rows.length,
+      users: result.rows,
+      credentials: {
+        admin: { username: 'admin', password: 'admin123', role: 'admin' },
+        manager: { username: 'manager', password: 'manager123', role: 'manager' },
+        storekeeper: { username: 'storekeeper', password: 'keeper123', role: 'storekeeper' }
+      }
+    });
+    
+  } catch (err) {
+    console.error('Init error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== TEST LOGIN ENDPOINT ==========
+app.post('/api/test-login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  try {
+    const result = await db.execute({ 
+      sql: 'SELECT id, username, password_hash, role FROM users WHERE username = ?', 
+      args: [username] 
+    });
+    
+    if (result.rows.length === 0) {
+      return res.json({ success: false, error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    const passwordMatch = bcrypt.compareSync(password, user.password_hash);
+    
+    res.json({ 
+      success: passwordMatch,
+      username: user.username,
+      role: user.role,
+      message: passwordMatch ? '✅ Password correct! Login would work' : '❌ Invalid password'
+    });
+    
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ========== GET ALL USERS (DEBUG) ==========
+app.get('/api/all-users', async (req, res) => {
+  try {
+    const result = await db.execute('SELECT id, username, role, email FROM users');
+    res.json({ success: true, count: result.rows.length, users: result.rows });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
 // ========== LOGIN ==========
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   console.log(`Login attempt: ${username}`);
+  
   try {
-    const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
+    const result = await db.execute({ 
+      sql: 'SELECT * FROM users WHERE username = ?', 
+      args: [username] 
+    });
+    
     if (result.rows.length === 0) {
       console.log(`User not found: ${username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    
     const user = result.rows[0];
     console.log(`User found: ${username}, role: ${user.role}`);
+    
     if (bcrypt.compareSync(password, user.password_hash)) {
       const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
       console.log(`Login successful: ${username}`);
-      res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } });
+      res.json({ 
+        token, 
+        user: { 
+          id: user.id, 
+          username: user.username, 
+          full_name: user.full_name, 
+          role: user.role, 
+          email: user.email 
+        } 
+      });
     } else {
       console.log(`Invalid password for: ${username}`);
       res.status(401).json({ error: 'Invalid credentials' });
@@ -164,7 +279,6 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   console.log(`📦 Receiving: ${part_number}, Qty: ${quantity}`);
   
   try {
-    // Check if part exists
     const partResult = await db.execute({ 
       sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', 
       args: [part_number] 
@@ -182,26 +296,21 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
     
     console.log(`📊 Stock update: ${oldQuantity} → ${newQuantity} (+${addQuantity})`);
     
-    // Start transaction
     await db.execute('BEGIN TRANSACTION');
     
-    // Insert transaction record
     await db.execute({ 
       sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) 
             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
       args: [part.id, 'RECEIVE', addQuantity, reference_number, notes, req.user.username] 
     });
     
-    // Update part stock
     await db.execute({ 
       sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', 
       args: [newQuantity, part.id] 
     });
     
-    // Commit transaction
     await db.execute('COMMIT');
     
-    // Verify the update
     const verifyResult = await db.execute({ 
       sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', 
       args: [part.id] 
@@ -518,38 +627,15 @@ app.get('/api/debug/stock/:part_number', authenticateToken, async (req, res) => 
   }
 });
 
-// ========== CREATE DEFAULT USERS ==========
-const createDefaultUsers = async () => {
-  const defaultUsers = [
-    ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
-    ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
-    ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
-  ];
-  for (const user of defaultUsers) {
-    try {
-      await db.execute({ 
-        sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
-        args: user 
-      });
-      console.log(`✅ User ${user[0]} created/verified`);
-    } catch (err) {
-      console.log(`Error creating user ${user[0]}:`, err.message);
-    }
-  }
-  const result = await db.execute('SELECT username FROM users');
-  console.log(`📋 Total users in database: ${result.rows.length}`);
-  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
-};
-
-setTimeout(createDefaultUsers, 3000);
-
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
-  console.log(`✅ Using Turso cloud database (persistent, never expires)`);
+  console.log(`✅ Using Turso cloud database`);
   console.log(`✅ CORS enabled for: ${allowedOrigins.join(', ')}`);
   console.log(`✅ Frontend URL: https://casgseinv.onrender.com`);
-  console.log(`\n📋 Default Logins:`);
+  console.log(`\n📋 TO FIX LOGIN - Call this endpoint first:`);
+  console.log(`   POST https://gse-backend.onrender.com/api/init-users`);
+  console.log(`\n📋 Default Logins (after initialization):`);
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
