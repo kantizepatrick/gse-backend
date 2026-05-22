@@ -9,7 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = 'gse_inventory_secret_key_2024';
 
-// ========== CORS CONFIGURATION ==========
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5000',
@@ -31,7 +30,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// ========== TURSO DATABASE CONNECTION ==========
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
@@ -99,161 +97,34 @@ const createTables = async () => {
       FOREIGN KEY (part_id) REFERENCES parts(id)
     )`);
     
-    console.log('✅ Tables created/verified');
+    console.log('✅ Tables ready');
   } catch (err) {
     console.error('Table error:', err.message);
   }
 };
 
-// ========== FORCE CREATE USERS ==========
+// ========== CREATE USERS ==========
 const createUsers = async () => {
-  console.log('🔧 Creating users...');
-  
-  const usersToCreate = [
+  const users = [
     { username: 'admin', password: 'admin123', full_name: 'System Admin', role: 'admin', email: 'admin@example.com' },
     { username: 'manager', password: 'manager123', full_name: 'GSE Manager', role: 'manager', email: 'manager@example.com' },
     { username: 'storekeeper', password: 'keeper123', full_name: 'Store Keeper', role: 'storekeeper', email: 'storekeeper@example.com' }
   ];
   
-  let created = 0;
-  let failed = 0;
-  
-  for (const user of usersToCreate) {
-    try {
-      const existing = await db.execute({ 
-        sql: 'SELECT id FROM users WHERE username = ?', 
-        args: [user.username] 
+  for (const user of users) {
+    const existing = await db.execute({ sql: 'SELECT id FROM users WHERE username = ?', args: [user.username] });
+    if (existing.rows.length === 0) {
+      const hashedPassword = bcrypt.hashSync(user.password, 10);
+      await db.execute({ 
+        sql: 'INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)', 
+        args: [user.username, hashedPassword, user.full_name, user.role, user.email] 
       });
-      
-      if (existing.rows.length === 0) {
-        const hashedPassword = bcrypt.hashSync(user.password, 10);
-        await db.execute({ 
-          sql: 'INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)', 
-          args: [user.username, hashedPassword, user.full_name, user.role, user.email] 
-        });
-        console.log(`✅ Created user: ${user.username} with password: ${user.password}`);
-        created++;
-      } else {
-        console.log(`✅ User already exists: ${user.username}`);
-      }
-    } catch (err) {
-      console.log(`❌ Failed to create ${user.username}:`, err.message);
-      failed++;
+      console.log(`✅ Created user: ${user.username}`);
     }
   }
-  
-  console.log(`📋 Users created: ${created}, Failed: ${failed}`);
-  
-  // Verify users
-  const result = await db.execute('SELECT id, username, role FROM users');
-  console.log(`📋 Total users in DB: ${result.rows.length}`);
-  result.rows.forEach(u => console.log(`   - ${u.username} (${u.role})`));
-  
-  return result.rows;
 };
 
-// ========== INIT USERS ENDPOINT ==========
-app.get('/api/init-users', async (req, res) => {
-  try {
-    const users = await createUsers();
-    res.json({ success: true, users: users });
-  } catch (err) {
-    console.error('Init error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/init-users', async (req, res) => {
-  try {
-    const users = await createUsers();
-    res.json({ success: true, users: users });
-  } catch (err) {
-    console.error('Init error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ========== DEBUG USERS ==========
-app.get('/api/debug/users', async (req, res) => {
-  try {
-    const result = await db.execute('SELECT id, username, role FROM users');
-    res.json({ users: result.rows });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-// ========== TEST LOGIN ==========
-app.post('/api/test-login', async (req, res) => {
-  const { username, password } = req.body;
-  
-  try {
-    const result = await db.execute({ 
-      sql: 'SELECT * FROM users WHERE username = ?', 
-      args: [username] 
-    });
-    
-    if (result.rows.length === 0) {
-      return res.json({ success: false, message: 'User not found' });
-    }
-    
-    const user = result.rows[0];
-    const passwordMatch = bcrypt.compareSync(password, user.password_hash);
-    
-    res.json({ 
-      success: passwordMatch,
-      username: user.username,
-      role: user.role,
-      message: passwordMatch ? 'Password correct!' : 'Password incorrect'
-    });
-  } catch (err) {
-    res.json({ success: false, error: err.message });
-  }
-});
-
-// ========== LOGIN ==========
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  console.log(`Login attempt: ${username}`);
-  
-  try {
-    const result = await db.execute({ 
-      sql: 'SELECT * FROM users WHERE username = ?', 
-      args: [username] 
-    });
-    
-    if (result.rows.length === 0) {
-      console.log(`User not found: ${username}`);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    const user = result.rows[0];
-    console.log(`User found: ${username}, role: ${user.role}`);
-    
-    if (bcrypt.compareSync(password, user.password_hash)) {
-      const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
-      console.log(`Login successful: ${username}`);
-      res.json({ 
-        token, 
-        user: { 
-          id: user.id, 
-          username: user.username, 
-          full_name: user.full_name, 
-          role: user.role, 
-          email: user.email 
-        } 
-      });
-    } else {
-      console.log(`Invalid password for: ${username}`);
-      res.status(401).json({ error: 'Invalid credentials' });
-    }
-  } catch (err) {
-    console.error('Login error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== AUTHENTICATION MIDDLEWARE ==========
+// ========== AUTHENTICATION ==========
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -264,6 +135,28 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+// ========== LOGIN ==========
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  try {
+    const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    if (bcrypt.compareSync(password, user.password_hash)) {
+      const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
+      res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } });
+    } else {
+      res.status(401).json({ error: 'Invalid credentials' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ========== GET PARTS ==========
 app.get('/api/parts', authenticateToken, async (req, res) => {
@@ -281,7 +174,6 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   
   try {
     const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    
     if (partResult.rows.length === 0) {
       return res.status(404).json({ error: 'Part not found' });
     }
@@ -309,13 +201,11 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
   
   try {
     const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    
     if (partResult.rows.length === 0) {
       return res.status(404).json({ error: 'Part not found' });
     }
     
     const part = partResult.rows[0];
-    
     if (part.quantity_on_hand < parseInt(quantity)) {
       return res.status(400).json({ error: 'Insufficient stock available' });
     }
@@ -364,17 +254,17 @@ app.post('/api/requests/:id/approve', authenticateToken, async (req, res) => {
   }
   
   try {
-    const requestResult = await db.execute({ sql: 'SELECT * FROM pending_issues WHERE id = ? AND status = "pending"', args: [id] });
+    const requestResult = await db.execute({ 
+      sql: "SELECT * FROM pending_issues WHERE id = ? AND status = 'pending'", 
+      args: [id] 
+    });
     
     if (requestResult.rows.length === 0) {
       return res.status(404).json({ error: 'Request not found' });
     }
     
     const request = requestResult.rows[0];
-    
-    const partResult = await db.execute({ sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', args: [request.part_id] });
-    const currentStock = partResult.rows[0].quantity_on_hand;
-    const newStock = currentStock - parseInt(request.quantity);
+    const newStock = request.quantity_on_hand - parseInt(request.quantity);
     
     await db.execute({ 
       sql: `INSERT INTO transactions 
@@ -386,7 +276,7 @@ app.post('/api/requests/:id/approve', authenticateToken, async (req, res) => {
     await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', args: [newStock, request.part_id] });
     
     await db.execute({ 
-      sql: `UPDATE pending_issues SET status = 'approved', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?`, 
+      sql: "UPDATE pending_issues SET status = 'approved', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?", 
       args: [comment || null, req.user.username, id] 
     });
     
@@ -407,7 +297,7 @@ app.post('/api/requests/:id/reject', authenticateToken, async (req, res) => {
   
   try {
     await db.execute({ 
-      sql: `UPDATE pending_issues SET status = 'rejected', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?`, 
+      sql: "UPDATE pending_issues SET status = 'rejected', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?", 
       args: [comment || null, req.user.username, id] 
     });
     
@@ -417,7 +307,7 @@ app.post('/api/requests/:id/reject', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET MY REQUESTS ==========
+// ========== MY REQUESTS ==========
 app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute({ 
@@ -451,84 +341,17 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET TRANSACTIONS ==========
-app.get('/api/transactions', authenticateToken, async (req, res) => {
+// ========== DEBUG ==========
+app.get('/api/debug/users', async (req, res) => {
   try {
-    const result = await db.execute(`
-      SELECT t.*, p.part_number, p.description 
-      FROM transactions t 
-      JOIN parts p ON t.part_id = p.id 
-      ORDER BY t.created_at DESC 
-      LIMIT 50
-    `);
-    res.json(result.rows);
+    const result = await db.execute('SELECT id, username, role FROM users');
+    res.json({ users: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== LOW STOCK REPORT ==========
-app.get('/api/reports/low-stock', authenticateToken, async (req, res) => {
-  try {
-    const result = await db.execute(`
-      SELECT part_number, description, quantity_on_hand, min_stock, location_bin 
-      FROM parts 
-      WHERE quantity_on_hand <= min_stock
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== USER MANAGEMENT ==========
-app.get('/api/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  try {
-    const result = await db.execute('SELECT id, username, full_name, role, email FROM users');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { username, password, full_name, role, email } = req.body;
-  const password_hash = bcrypt.hashSync(password, 10);
-  try {
-    await db.execute({ 
-      sql: `INSERT INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
-      args: [username, password_hash, full_name, role || 'storekeeper', email || null] 
-    });
-    res.json({ message: 'User created successfully' });
-  } catch (err) {
-    res.status(500).json({ error: 'Username already exists' });
-  }
-});
-
-// ========== CHANGE PASSWORD ==========
-app.post('/api/change-password', authenticateToken, async (req, res) => {
-  const { current_password, new_password } = req.body;
-  
-  try {
-    const result = await db.execute({ sql: 'SELECT password_hash FROM users WHERE id = ?', args: [req.user.id] });
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    
-    if (!bcrypt.compareSync(current_password, result.rows[0].password_hash)) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
-    }
-    
-    const new_hash = bcrypt.hashSync(new_password, 10);
-    await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [new_hash, req.user.id] });
-    res.json({ message: 'Password changed successfully!' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.json({ error: err.message });
   }
 });
 
 // ========== START SERVER ==========
-// Create tables and users on startup
 const init = async () => {
   await createTables();
   await createUsers();
@@ -537,9 +360,5 @@ const init = async () => {
 init();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ GSE Server running on port ${PORT}`);
-  console.log(`\n📋 Login with:`);
-  console.log(`   admin / admin123 (Admin)`);
-  console.log(`   manager / manager123 (Manager)`);
-  console.log(`   storekeeper / keeper123 (Storekeeper)`);
+  console.log(`✅ Server running on port ${PORT}`);
 });
