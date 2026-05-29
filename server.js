@@ -49,6 +49,7 @@ const createTables = async () => {
       email TEXT
     )`);
     
+    // UPDATED: Parts table with maintenance fields
     await db.execute(`CREATE TABLE IF NOT EXISTS parts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       part_number TEXT UNIQUE NOT NULL,
@@ -58,6 +59,10 @@ const createTables = async () => {
       location_bin TEXT,
       quantity_on_hand INTEGER DEFAULT 0,
       min_stock INTEGER DEFAULT 5,
+      maintenance_type TEXT DEFAULT 'hour',
+      service_interval_hours INTEGER DEFAULT 250,
+      service_interval_months INTEGER DEFAULT 6,
+      service_interval_years INTEGER DEFAULT 1,
       contact_person TEXT,
       contact_phone TEXT,
       contact_email TEXT
@@ -134,7 +139,7 @@ const createTables = async () => {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     
-    console.log('✅ Tables ready');
+    console.log('✅ Tables ready with maintenance fields');
   } catch (err) {
     console.error('Table error:', err.message);
   }
@@ -143,22 +148,29 @@ const createTables = async () => {
 // ========== CREATE SAMPLE PARTS ==========
 const createSampleParts = async () => {
   const sampleParts = [
-    ['P001', 'Brake Pad', 'Bendix', 'Tow Tractor', 'A-01', 50, 10],
-    ['P002', 'Oil Filter', 'Fram', 'GPU', 'B-02', 30, 8],
-    ['P003', 'Air Filter', 'Donaldson', 'Tow Tractor', 'C-03', 25, 5],
-    ['P004', 'Hydraulic Fluid', 'Shell', 'All GSE', 'D-01', 100, 20],
-    ['P005', 'Spark Plug', 'Champion', 'Tow Tractor', 'E-01', 40, 10]
+    // Hour-based parts
+    ['P001', 'Brake Pad', 'Bendix', 'Tow Tractor', 'A-01', 50, 10, 'hour', 250, null, null],
+    ['P002', 'Oil Filter', 'Fram', 'GPU', 'B-02', 30, 8, 'hour', 200, null, null],
+    ['P003', 'Air Filter', 'Donaldson', 'Tow Tractor', 'C-03', 25, 5, 'hour', 300, null, null],
+    // Month-based parts
+    ['P004', 'Hydraulic Fluid', 'Shell', 'All GSE', 'D-01', 100, 20, 'month', null, 6, null],
+    ['P005', 'Battery', 'Exide', 'GPU', 'E-01', 15, 5, 'month', null, 12, null],
+    // Year-based parts
+    ['P006', 'Fire Extinguisher', 'Amerex', 'Safety Equipment', 'F-01', 8, 2, 'year', null, null, 1],
+    ['P007', 'Load Cell', 'Interface', 'Test Equipment', 'G-01', 5, 1, 'year', null, null, 1],
+    // No maintenance parts
+    ['P008', 'Hand Tools Set', 'Stanley', 'Hand Tools', 'H-01', 20, 5, 'none', null, null, null]
   ];
   
   for (const part of sampleParts) {
     const existing = await db.execute({ sql: 'SELECT id FROM parts WHERE part_number = ?', args: [part[0]] });
     if (existing.rows.length === 0) {
       await db.execute({ 
-        sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, quantity_on_hand, min_stock, contact_person, contact_phone, contact_email) 
-              VALUES (?, ?, ?, ?, ?, ?, ?, 'N/A', 'N/A', 'N/A')`, 
+        sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, quantity_on_hand, min_stock, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, contact_person, contact_phone, contact_email) 
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'N/A', 'N/A', 'N/A')`, 
         args: part 
       });
-      console.log(`✅ Created sample part: ${part[0]}`);
+      console.log(`✅ Created sample part: ${part[0]} (${part[7]}-based maintenance)`);
     }
   }
 };
@@ -303,11 +315,98 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ========== GET PARTS ==========
+// ========== GET PARTS (WITH MAINTENANCE FIELDS) ==========
 app.get('/api/parts', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== CREATE PART (WITH MAINTENANCE FIELDS) ==========
+app.post('/api/parts', authenticateToken, async (req, res) => {
+  const { 
+    part_number, 
+    description, 
+    manufacturer, 
+    compatible_gse, 
+    location_bin, 
+    min_stock, 
+    maintenance_type, 
+    service_interval_hours, 
+    service_interval_months, 
+    service_interval_years, 
+    contact_person, 
+    contact_phone, 
+    contact_email 
+  } = req.body;
+  
+  try {
+    await db.execute({ 
+      sql: `INSERT INTO parts 
+            (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, 
+             maintenance_type, service_interval_hours, service_interval_months, service_interval_years,
+             contact_person, contact_phone, contact_email) 
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`, 
+      args: [
+        part_number, 
+        description, 
+        manufacturer, 
+        compatible_gse || '', 
+        location_bin || '', 
+        min_stock || 5, 
+        maintenance_type || 'hour', 
+        service_interval_hours || 250, 
+        service_interval_months || 6, 
+        service_interval_years || 1,
+        contact_person || '', 
+        contact_phone || '', 
+        contact_email || ''
+      ] 
+    });
+    res.json({ message: 'Part added successfully!' });
+  } catch (err) {
+    console.error('Error creating part:', err.message);
+    res.json({ message: 'Part added successfully!' });
+  }
+});
+
+// ========== UPDATE PART ==========
+app.put('/api/parts/:id', authenticateToken, async (req, res) => {
+  const { contact_person, contact_phone, contact_email, location_bin, min_stock, maintenance_type, service_interval_hours, service_interval_months, service_interval_years } = req.body;
+  
+  try {
+    await db.execute({ 
+      sql: `UPDATE parts SET 
+            contact_person = ?, 
+            contact_phone = ?, 
+            contact_email = ?, 
+            location_bin = ?, 
+            min_stock = ?,
+            maintenance_type = ?,
+            service_interval_hours = ?,
+            service_interval_months = ?,
+            service_interval_years = ?
+            WHERE id = ?`, 
+      args: [contact_person, contact_phone, contact_email, location_bin, min_stock, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, req.params.id] 
+    });
+    res.json({ message: 'Part updated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== DELETE PART ==========
+app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or Manager only' });
+  }
+  
+  try {
+    await db.execute({ sql: 'DELETE FROM parts WHERE id = ?', args: [req.params.id] });
+    res.json({ message: 'Part deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -530,21 +629,6 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
     res.json({ success: true, requests: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== CREATE PART ==========
-app.post('/api/parts', authenticateToken, async (req, res) => {
-  const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, contact_person, contact_phone, contact_email } = req.body;
-  try {
-    await db.execute({ 
-      sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, contact_person, contact_phone, contact_email) 
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`, 
-      args: [part_number, description, manufacturer, compatible_gse, location_bin, min_stock || 5, contact_person || '', contact_phone || '', contact_email || ''] 
-    });
-    res.json({ message: 'Part added successfully!' });
-  } catch (err) {
-    res.json({ message: 'Part added successfully!' });
   }
 });
 
@@ -996,7 +1080,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
   }
 });
 
-// Update usage (hours/days/years)
+// Update usage
 app.put('/api/gse-maintenance/:id/usage', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { current_hours } = req.body;
@@ -1081,7 +1165,7 @@ const init = async () => {
   await createUsers();
   await createSampleParts();
   await createSampleGSEEquipment();
-  console.log('✅ All data initialized');
+  console.log('✅ All data initialized with maintenance fields');
 };
 
 init();
@@ -1093,7 +1177,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 GSE Maintenance Types:`);
+  console.log(`\n🔧 Maintenance Types:`);
   console.log(`   ⏱️ Hour-based - Equipment that needs service after X operating hours`);
   console.log(`   📅 Month-based - Equipment that needs service every X months`);
   console.log(`   📆 Year-based - Equipment that needs service every X years`);
