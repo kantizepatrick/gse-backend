@@ -97,6 +97,43 @@ const createTables = async () => {
       FOREIGN KEY (part_id) REFERENCES parts(id)
     )`);
     
+    // GSE Maintenance Table with multiple maintenance types
+    await db.execute(`CREATE TABLE IF NOT EXISTS gse_maintenance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      equipment_name TEXT NOT NULL,
+      equipment_type TEXT,
+      maintenance_type TEXT DEFAULT 'hour',
+      
+      -- For hour-based maintenance
+      last_service_hours INTEGER DEFAULT 0,
+      current_hours INTEGER DEFAULT 0,
+      service_interval_hours INTEGER DEFAULT 250,
+      next_service_hours INTEGER DEFAULT 0,
+      hours_remaining INTEGER DEFAULT 0,
+      
+      -- For month-based maintenance
+      last_service_date TEXT,
+      service_interval_months INTEGER DEFAULT 6,
+      next_service_date TEXT,
+      days_remaining INTEGER DEFAULT 0,
+      
+      -- For year-based maintenance
+      last_service_year INTEGER,
+      service_interval_years INTEGER DEFAULT 1,
+      next_service_year INTEGER,
+      years_remaining INTEGER DEFAULT 0,
+      
+      -- Common fields
+      service_performed TEXT,
+      technician_name TEXT,
+      notes TEXT,
+      date_performed DATETIME DEFAULT CURRENT_TIMESTAMP,
+      status TEXT DEFAULT 'upcoming',
+      created_by TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
     console.log('✅ Tables ready');
   } catch (err) {
     console.error('Table error:', err.message);
@@ -126,6 +163,71 @@ const createSampleParts = async () => {
   }
 };
 
+// ========== CREATE SAMPLE GSE EQUIPMENT ==========
+const createSampleGSEEquipment = async () => {
+  const sampleEquipment = [
+    // Hour-based equipment
+    ['Tow Tractor #5', 'Tow Tractor', 'hour', 1250, 250, null, null, null, null, 'Oil change, Filter replaced', 'John Smith', 'Initial setup'],
+    ['GPU Unit #2', 'GPU', 'hour', 800, 200, null, null, null, null, 'Battery check, Cable inspection', 'Jane Doe', ''],
+    // Month-based equipment
+    ['Battery Charger #3', 'Battery Charger', 'month', null, null, '2025-01-15', 6, null, null, 'Calibration, Terminal cleaning', 'Bob Wilson', ''],
+    ['Hydraulic Test Stand', 'Test Equipment', 'month', null, null, '2024-12-01', 3, null, null, 'Fluid check, Pressure test', 'Alice Brown', ''],
+    // Year-based equipment
+    ['Fire Extinguisher #1', 'Safety Equipment', 'year', null, null, null, null, 2024, 1, 'Annual inspection, Pressure check', 'Tom Harris', ''],
+    ['Annual Lift Inspection', 'Lifting Equipment', 'year', null, null, null, null, 2024, 1, 'Full structural inspection', 'Mike Wilson', ''],
+    // No maintenance
+    ['Hand Tool Set #7', 'Hand Tools', 'none', null, null, null, null, null, null, null, null, 'No scheduled maintenance required']
+  ];
+  
+  for (const eq of sampleEquipment) {
+    const existing = await db.execute({ sql: 'SELECT id FROM gse_maintenance WHERE equipment_name = ?', args: [eq[0]] });
+    if (existing.rows.length === 0) {
+      let next_service_hours = null;
+      let hours_remaining = null;
+      let next_service_date = null;
+      let days_remaining = null;
+      let next_service_year = null;
+      let years_remaining = null;
+      let status = 'upcoming';
+      
+      if (eq[2] === 'hour') {
+        const lastHours = eq[3];
+        const interval = eq[4];
+        next_service_hours = lastHours + interval;
+        hours_remaining = interval;
+      } else if (eq[2] === 'month') {
+        const lastDate = new Date(eq[5]);
+        const intervalMonths = eq[6];
+        next_service_date = new Date(lastDate);
+        next_service_date.setMonth(next_service_date.getMonth() + intervalMonths);
+        const today = new Date();
+        days_remaining = Math.max(0, Math.ceil((next_service_date - today) / (1000 * 60 * 60 * 24)));
+        status = days_remaining <= 0 ? 'overdue' : days_remaining <= 14 ? 'due_soon' : 'upcoming';
+        next_service_date = next_service_date.toISOString().split('T')[0];
+      } else if (eq[2] === 'year') {
+        next_service_year = eq[7] + eq[8];
+        const currentYear = new Date().getFullYear();
+        years_remaining = Math.max(0, next_service_year - currentYear);
+        status = years_remaining <= 0 ? 'overdue' : years_remaining === 0 ? 'due_soon' : 'upcoming';
+      } else {
+        status = 'no_maintenance';
+      }
+      
+      await db.execute({ 
+        sql: `INSERT INTO gse_maintenance 
+              (equipment_name, equipment_type, maintenance_type,
+               last_service_hours, service_interval_hours, next_service_hours, hours_remaining,
+               last_service_date, service_interval_months, next_service_date, days_remaining,
+               last_service_year, service_interval_years, next_service_year, years_remaining,
+               service_performed, technician_name, notes, status, created_by, created_at, updated_at) 
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'system', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, 
+        args: [eq[0], eq[1], eq[2], eq[3], eq[4], next_service_hours, hours_remaining, eq[5], eq[6], next_service_date, days_remaining, eq[7], eq[8], next_service_year, years_remaining, eq[9], eq[10], eq[11], status] 
+      });
+      console.log(`✅ Created sample GSE: ${eq[0]}`);
+    }
+  }
+};
+
 // ========== CREATE DEFAULT USERS ==========
 const createUsers = async () => {
   const users = [
@@ -148,7 +250,6 @@ const createUsers = async () => {
     }
   }
   
-  // Verify users
   const result = await db.execute('SELECT id, username, role FROM users');
   console.log(`📋 Total users: ${result.rows.length}`);
   result.rows.forEach(u => console.log(`   - ${u.username} (${u.role})`));
@@ -514,7 +615,7 @@ app.delete('/api/users/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== CHANGE PASSWORD (User Self Reset) ==========
+// ========== CHANGE PASSWORD ==========
 app.post('/api/change-password', authenticateToken, async (req, res) => {
   const { current_password, new_password } = req.body;
   
@@ -541,13 +642,12 @@ app.post('/api/change-password', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== ADMIN RESET PASSWORD FOR ANY USER ==========
+// ========== ADMIN RESET PASSWORD ==========
 app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
   const { user_id, new_password } = req.body;
   
   console.log(`🔐 Admin reset password request by: ${req.user.username} for user_id: ${user_id}`);
   
-  // Check if user is admin
   if (req.user.role !== 'admin') {
     console.log(`❌ Access denied: ${req.user.username} is not admin`);
     return res.status(403).json({ error: 'Access denied. Admin only.' });
@@ -562,7 +662,6 @@ app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
   }
   
   try {
-    // Check if user exists
     const userResult = await db.execute({ 
       sql: 'SELECT id, username FROM users WHERE id = ?', 
       args: [user_id] 
@@ -573,11 +672,8 @@ app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
     }
     
     const targetUser = userResult.rows[0];
-    
-    // Hash the new password
     const newHashedPassword = bcrypt.hashSync(new_password, 10);
     
-    // Update user's password
     await db.execute({ 
       sql: 'UPDATE users SET password_hash = ? WHERE id = ?', 
       args: [newHashedPassword, user_id] 
@@ -597,7 +693,7 @@ app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== FORGOT PASSWORD (Self Reset with Code) ==========
+// ========== FORGOT PASSWORD ==========
 const resetCodes = new Map();
 
 app.post('/api/forgot-password', async (req, res) => {
@@ -699,6 +795,276 @@ app.post('/api/reset-password', async (req, res) => {
   }
 });
 
+// ========== GSE MAINTENANCE SCHEDULE API ==========
+
+// Get all GSE equipment
+app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.execute(`
+      SELECT * FROM gse_maintenance 
+      ORDER BY 
+        CASE maintenance_type
+          WHEN 'none' THEN 0
+          WHEN 'hour' THEN 1
+          WHEN 'month' THEN 2
+          WHEN 'year' THEN 3
+        END,
+        equipment_name ASC
+    `);
+    res.json({ success: true, equipment: result.rows });
+  } catch (err) {
+    console.error('Error fetching GSE maintenance:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get single equipment by ID
+app.get('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.execute({ 
+      sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
+      args: [req.params.id] 
+    });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    res.json({ success: true, equipment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add new equipment
+app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
+  const { 
+    equipment_name, 
+    equipment_type, 
+    maintenance_type,
+    last_service_hours,
+    current_hours,
+    service_interval_hours,
+    last_service_date,
+    service_interval_months,
+    last_service_year,
+    service_interval_years,
+    service_performed,
+    technician_name,
+    notes 
+  } = req.body;
+  
+  if (!equipment_name) {
+    return res.status(400).json({ error: 'Equipment name is required' });
+  }
+  
+  const maintType = maintenance_type || 'hour';
+  let next_service_hours = null;
+  let hours_remaining = null;
+  let next_service_date = null;
+  let days_remaining = null;
+  let next_service_year = null;
+  let years_remaining = null;
+  let status = 'upcoming';
+  
+  if (maintType === 'hour') {
+    const interval = service_interval_hours || 250;
+    const lastHours = last_service_hours || 0;
+    const currentHrs = current_hours || lastHours;
+    next_service_hours = lastHours + interval;
+    hours_remaining = Math.max(0, next_service_hours - currentHrs);
+    status = hours_remaining <= 0 ? 'overdue' : hours_remaining <= 50 ? 'due_soon' : 'upcoming';
+  } else if (maintType === 'month') {
+    const intervalMonths = service_interval_months || 6;
+    const lastDate = last_service_date ? new Date(last_service_date) : new Date();
+    next_service_date = new Date(lastDate);
+    next_service_date.setMonth(next_service_date.getMonth() + intervalMonths);
+    const today = new Date();
+    days_remaining = Math.max(0, Math.ceil((next_service_date - today) / (1000 * 60 * 60 * 24)));
+    status = days_remaining <= 0 ? 'overdue' : days_remaining <= 14 ? 'due_soon' : 'upcoming';
+    next_service_date = next_service_date.toISOString().split('T')[0];
+  } else if (maintType === 'year') {
+    const intervalYears = service_interval_years || 1;
+    const lastYear = last_service_year || new Date().getFullYear();
+    next_service_year = lastYear + intervalYears;
+    const currentYear = new Date().getFullYear();
+    years_remaining = Math.max(0, next_service_year - currentYear);
+    status = years_remaining <= 0 ? 'overdue' : years_remaining === 0 ? 'due_soon' : 'upcoming';
+  } else {
+    status = 'no_maintenance';
+  }
+  
+  try {
+    const result = await db.execute({ 
+      sql: `INSERT INTO gse_maintenance 
+            (equipment_name, equipment_type, maintenance_type,
+             last_service_hours, current_hours, service_interval_hours, next_service_hours, hours_remaining,
+             last_service_date, service_interval_months, next_service_date, days_remaining,
+             last_service_year, service_interval_years, next_service_year, years_remaining,
+             service_performed, technician_name, notes, status, created_by, created_at, updated_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, 
+      args: [equipment_name, equipment_type, maintType,
+             last_service_hours || 0, current_hours || 0, service_interval_hours || 250, next_service_hours, hours_remaining,
+             last_service_date || null, service_interval_months || 6, next_service_date, days_remaining,
+             last_service_year || null, service_interval_years || 1, next_service_year, years_remaining,
+             service_performed, technician_name, notes, status, req.user.username] 
+    });
+    res.json({ success: true, id: result.lastInsertRowid, message: 'Equipment added to maintenance schedule' });
+  } catch (err) {
+    console.error('Error adding equipment:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Record service
+app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { 
+    current_hours,
+    service_performed, 
+    technician_name, 
+    notes,
+    service_interval_hours,
+    service_interval_months,
+    service_interval_years
+  } = req.body;
+  
+  try {
+    const equipResult = await db.execute({ 
+      sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
+      args: [id] 
+    });
+    
+    if (equipResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    
+    const equip = equipResult.rows[0];
+    const maintType = equip.maintenance_type;
+    
+    if (maintType === 'hour') {
+      const newHours = parseInt(current_hours) || equip.current_hours;
+      const interval = service_interval_hours || equip.service_interval_hours || 250;
+      const nextDue = newHours + interval;
+      const hoursRemaining = interval;
+      
+      await db.execute({ 
+        sql: `UPDATE gse_maintenance 
+              SET last_service_hours = ?, current_hours = ?, service_interval_hours = ?, 
+                  next_service_hours = ?, hours_remaining = ?, status = 'upcoming',
+                  service_performed = ?, technician_name = ?, notes = ?,
+                  date_performed = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?`, 
+        args: [newHours, newHours, interval, nextDue, hoursRemaining, service_performed, technician_name, notes, id] 
+      });
+    } else if (maintType === 'month') {
+      const intervalMonths = service_interval_months || equip.service_interval_months || 6;
+      const now = new Date();
+      const nextDate = new Date(now);
+      nextDate.setMonth(nextDate.getMonth() + intervalMonths);
+      const daysRemaining = Math.ceil((nextDate - now) / (1000 * 60 * 60 * 24));
+      
+      await db.execute({ 
+        sql: `UPDATE gse_maintenance 
+              SET last_service_date = date('now'), service_interval_months = ?, 
+                  next_service_date = ?, days_remaining = ?, status = 'upcoming',
+                  service_performed = ?, technician_name = ?, notes = ?,
+                  date_performed = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?`, 
+        args: [intervalMonths, nextDate.toISOString().split('T')[0], daysRemaining, service_performed, technician_name, notes, id] 
+      });
+    } else if (maintType === 'year') {
+      const intervalYears = service_interval_years || equip.service_interval_years || 1;
+      const currentYear = new Date().getFullYear();
+      const nextYear = currentYear + intervalYears;
+      
+      await db.execute({ 
+        sql: `UPDATE gse_maintenance 
+              SET last_service_year = ?, service_interval_years = ?, 
+                  next_service_year = ?, years_remaining = ?, status = 'upcoming',
+                  service_performed = ?, technician_name = ?, notes = ?,
+                  date_performed = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?`, 
+        args: [currentYear, intervalYears, nextYear, intervalYears, service_performed, technician_name, notes, id] 
+      });
+    } else {
+      return res.status(400).json({ error: 'This equipment does not require maintenance' });
+    }
+    
+    res.json({ success: true, message: 'Service recorded successfully' });
+  } catch (err) {
+    console.error('Error recording service:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update usage (hours/days/years)
+app.put('/api/gse-maintenance/:id/usage', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { current_hours } = req.body;
+  
+  try {
+    const equipResult = await db.execute({ 
+      sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
+      args: [id] 
+    });
+    
+    if (equipResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    
+    const equip = equipResult.rows[0];
+    
+    if (equip.maintenance_type === 'hour') {
+      const newHours = parseInt(current_hours);
+      const nextDue = parseInt(equip.next_service_hours);
+      const hoursRemaining = Math.max(0, nextDue - newHours);
+      const status = hoursRemaining <= 0 ? 'overdue' : hoursRemaining <= 50 ? 'due_soon' : 'upcoming';
+      
+      await db.execute({ 
+        sql: `UPDATE gse_maintenance SET current_hours = ?, hours_remaining = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, 
+        args: [newHours, hoursRemaining, status, id] 
+      });
+    } else if (equip.maintenance_type === 'month') {
+      const today = new Date();
+      const nextDate = new Date(equip.next_service_date);
+      const daysRemaining = Math.max(0, Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24)));
+      const status = daysRemaining <= 0 ? 'overdue' : daysRemaining <= 14 ? 'due_soon' : 'upcoming';
+      
+      await db.execute({ 
+        sql: `UPDATE gse_maintenance SET days_remaining = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, 
+        args: [daysRemaining, status, id] 
+      });
+    } else if (equip.maintenance_type === 'year') {
+      const currentYear = new Date().getFullYear();
+      const yearsRemaining = Math.max(0, equip.next_service_year - currentYear);
+      const status = yearsRemaining <= 0 ? 'overdue' : yearsRemaining === 0 ? 'due_soon' : 'upcoming';
+      
+      await db.execute({ 
+        sql: `UPDATE gse_maintenance SET years_remaining = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, 
+        args: [yearsRemaining, status, id] 
+      });
+    }
+    
+    res.json({ success: true, message: 'Usage updated' });
+  } catch (err) {
+    console.error('Error updating usage:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete equipment
+app.delete('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or Manager only' });
+  }
+  
+  try {
+    await db.execute({ sql: 'DELETE FROM gse_maintenance WHERE id = ?', args: [req.params.id] });
+    res.json({ success: true, message: 'Equipment removed from maintenance schedule' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== DEBUG ENDPOINTS ==========
 app.get('/api/debug/users', async (req, res) => {
   try {
@@ -714,6 +1080,7 @@ const init = async () => {
   await createTables();
   await createUsers();
   await createSampleParts();
+  await createSampleGSEEquipment();
   console.log('✅ All data initialized');
 };
 
@@ -723,10 +1090,12 @@ init();
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
   console.log(`\n📋 Login with:`);
-  console.log(`   admin / admin123 (Admin - Can approve/reject & reset passwords)`);
-  console.log(`   manager / manager123 (Manager - Can approve/reject)`);
-  console.log(`   storekeeper / keeper123 (Storekeeper - Submits requests)`);
-  console.log(`\n🔐 Password Reset:`);
-  console.log(`   - Users can reset their own password via Forgot Password link`);
-  console.log(`   - Admins can reset any user's password from User Management page`);
+  console.log(`   admin / admin123 (Admin)`);
+  console.log(`   manager / manager123 (Manager)`);
+  console.log(`   storekeeper / keeper123 (Storekeeper)`);
+  console.log(`\n🔧 GSE Maintenance Types:`);
+  console.log(`   ⏱️ Hour-based - Equipment that needs service after X operating hours`);
+  console.log(`   📅 Month-based - Equipment that needs service every X months`);
+  console.log(`   📆 Year-based - Equipment that needs service every X years`);
+  console.log(`   ⭕ No maintenance - Equipment that doesn't require scheduled maintenance`);
 });
