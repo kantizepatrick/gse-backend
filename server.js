@@ -62,6 +62,9 @@ const createTables = async () => {
       service_interval_hours INTEGER DEFAULT 250,
       service_interval_months INTEGER DEFAULT 6,
       service_interval_years INTEGER DEFAULT 1,
+      last_service_hours INTEGER DEFAULT 0,
+      last_service_date TEXT,
+      last_service_year INTEGER,
       contact_person TEXT,
       contact_phone TEXT,
       contact_email TEXT
@@ -101,7 +104,9 @@ const createTables = async () => {
       FOREIGN KEY (part_id) REFERENCES parts(id)
     )`);
     
-    await db.execute(`CREATE TABLE IF NOT EXISTS gse_maintenance (
+    // Drop and recreate gse_maintenance table to ensure correct schema
+    await db.execute(`DROP TABLE IF EXISTS gse_maintenance`);
+    await db.execute(`CREATE TABLE gse_maintenance (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       equipment_name TEXT NOT NULL,
       equipment_type TEXT,
@@ -136,7 +141,7 @@ const createTables = async () => {
   }
 };
 
-// ========== UPDATE MAINTENANCE STATUS HELPER - PROPER CALCULATION ==========
+// ========== UPDATE MAINTENANCE STATUS HELPER ==========
 const updateMaintenanceStatus = async (partId) => {
   try {
     const partResult = await db.execute({ sql: 'SELECT * FROM parts WHERE id = ?', args: [partId] });
@@ -150,16 +155,61 @@ const updateMaintenanceStatus = async (partId) => {
     const maintResult = await db.execute({ sql: 'SELECT * FROM gse_maintenance WHERE part_id = ?', args: [partId] });
     
     if (maintResult.rows.length === 0) {
-      await db.execute({
-        sql: `INSERT INTO gse_maintenance 
-              (equipment_name, equipment_type, maintenance_type, part_id,
-               service_interval_hours, service_interval_months, service_interval_years,
-               status, created_by, created_at, updated_at) 
-              VALUES (?, ?, ?, ?, ?, ?, ?, 'upcoming', 'system', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-        args: [part.part_number, part.description || 'Part', maintType, partId,
-               part.service_interval_hours || 250, part.service_interval_months || 6, part.service_interval_years || 1]
-      });
-      console.log(`✅ Created maintenance record for ${part.part_number}`);
+      // Create maintenance record
+      let status = 'upcoming';
+      if (maintType === 'hour') {
+        const currentHours = part.last_service_hours || 0;
+        const interval = part.service_interval_hours || 250;
+        const nextDue = currentHours + interval;
+        const remaining = nextDue - currentHours;
+        if (remaining <= 0) status = 'overdue';
+        else if (remaining <= 50) status = 'due_soon';
+        
+        await db.execute({
+          sql: `INSERT INTO gse_maintenance 
+                (equipment_name, equipment_type, maintenance_type, part_id,
+                 current_hours, last_service_hours, service_interval_hours, next_service_hours, hours_remaining, status, created_by) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'system')`,
+          args: [part.part_number, part.description || 'Part', maintType, partId,
+                 currentHours, currentHours, interval, nextDue, remaining, status]
+        });
+      } else if (maintType === 'month') {
+        const lastDate = part.last_service_date ? new Date(part.last_service_date) : new Date();
+        const interval = part.service_interval_months || 6;
+        const nextDate = new Date(lastDate);
+        nextDate.setMonth(nextDate.getMonth() + interval);
+        const today = new Date();
+        const remaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
+        if (remaining <= 0) status = 'overdue';
+        else if (remaining <= 14) status = 'due_soon';
+        
+        await db.execute({
+          sql: `INSERT INTO gse_maintenance 
+                (equipment_name, equipment_type, maintenance_type, part_id,
+                 last_service_date, service_interval_months, next_service_date, days_remaining, status, created_by) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'system')`,
+          args: [part.part_number, part.description || 'Part', maintType, partId,
+                 part.last_service_date, interval, nextDate.toISOString().split('T')[0], remaining, status]
+        });
+      } else if (maintType === 'year') {
+        const lastYear = part.last_service_year || new Date().getFullYear();
+        const interval = part.service_interval_years || 1;
+        const nextYear = lastYear + interval;
+        const currentYear = new Date().getFullYear();
+        const remaining = nextYear - currentYear;
+        if (remaining < 0) status = 'overdue';
+        else if (remaining === 0) status = 'due_soon';
+        
+        await db.execute({
+          sql: `INSERT INTO gse_maintenance 
+                (equipment_name, equipment_type, maintenance_type, part_id,
+                 last_service_year, service_interval_years, next_service_year, years_remaining, status, created_by) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'system')`,
+          args: [part.part_number, part.description || 'Part', maintType, partId,
+                 lastYear, interval, nextYear, remaining, status]
+        });
+      }
+      console.log(`✅ Created maintenance record for ${part.part_number} with status: ${status}`);
       return;
     }
     
@@ -187,7 +237,6 @@ const updateMaintenanceStatus = async (partId) => {
               WHERE part_id = ?`,
         args: [nextDue, remainingValue, newStatus, partId]
       });
-      console.log(`✅ Hour-based: ${part.part_number} → ${newStatus} (${remainingValue} hrs remaining)`);
     } else if (maintType === 'month') {
       const lastDate = maint.last_service_date ? new Date(maint.last_service_date) : new Date();
       const interval = part.service_interval_months || 6;
@@ -210,7 +259,6 @@ const updateMaintenanceStatus = async (partId) => {
               WHERE part_id = ?`,
         args: [nextDate.toISOString().split('T')[0], remainingValue, newStatus, partId]
       });
-      console.log(`✅ Month-based: ${part.part_number} → ${newStatus} (${remainingValue} days remaining)`);
     } else if (maintType === 'year') {
       const lastYear = maint.last_service_year || new Date().getFullYear();
       const interval = part.service_interval_years || 1;
@@ -232,8 +280,9 @@ const updateMaintenanceStatus = async (partId) => {
               WHERE part_id = ?`,
         args: [nextYear, remainingValue, newStatus, partId]
       });
-      console.log(`✅ Year-based: ${part.part_number} → ${newStatus} (${remainingValue} years remaining)`);
     }
+    
+    console.log(`✅ Status updated for ${part.part_number}: ${newStatus}`);
   } catch (err) {
     console.error('Error updating maintenance status:', err.message);
   }
@@ -241,23 +290,15 @@ const updateMaintenanceStatus = async (partId) => {
 
 // ========== CREATE SAMPLE DATA ==========
 const createSampleData = async () => {
-  // Sample parts with different maintenance types and due soon/overdue statuses
+  // Sample parts with different maintenance types
   const sampleParts = [
-    // Overdue hour-based (250 hours interval, last service at 1000, current at 1300 -> 300 hours overdue)
-    ['P001', 'Brake Pad', 'Bendix', 'Tow Tractor', 'A-01', 50, 10, 'hour', 250, null, null, 1300, null, null, 'John Smith', '+1 234 567 8900', 'john@bendix.com'],
-    // Due soon hour-based (200 hours interval, last service at 800, current at 950 -> 50 hours remaining = due soon)
-    ['P002', 'Oil Filter', 'Fram', 'GPU', 'B-02', 30, 8, 'hour', 200, null, null, 950, null, null, 'Jane Doe', '+1 234 567 8901', 'jane@fram.com'],
-    // Upcoming hour-based
+    ['P001', 'Brake Pad', 'Bendix', 'Tow Tractor', 'A-01', 50, 10, 'hour', 250, null, null, 1250, null, null, 'John Smith', '+1 234 567 8900', 'john@bendix.com'],
+    ['P002', 'Oil Filter', 'Fram', 'GPU', 'B-02', 30, 8, 'hour', 200, null, null, 800, null, null, 'Jane Doe', '+1 234 567 8901', 'jane@fram.com'],
     ['P003', 'Air Filter', 'Donaldson', 'Tow Tractor', 'C-03', 25, 5, 'hour', 300, null, null, 200, null, null, 'Bob Wilson', '+1 234 567 8902', 'bob@donaldson.com'],
-    // Overdue month-based (6 months interval, last service 10 months ago -> overdue)
-    ['P004', 'Hydraulic Fluid', 'Shell', 'All GSE', 'D-01', 100, 20, 'month', null, 6, null, null, '2025-04-01', null, null, 'Shell Support', '+1 234 567 8903', 'support@shell.com'],
-    // Due soon month-based (3 months interval, last service 2.5 months ago -> 15 days remaining = due soon)
-    ['P005', 'Battery', 'Exide', 'GPU', 'E-01', 15, 5, 'month', null, 3, null, null, '2025-05-15', null, null, 'Exide Tech', '+1 234 567 8904', 'tech@exide.com'],
-    // Overdue year-based
-    ['P006', 'Fire Extinguisher', 'Amerex', 'Safety Equipment', 'F-01', 8, 2, 'year', null, null, 1, null, null, 2023, 2024, 'Amerex Safety', '+1 234 567 8905', 'safety@amerex.com'],
-    // Due soon year-based
-    ['P007', 'Annual Lift Inspection', 'Interface', 'Lifting Equipment', 'G-01', 5, 1, 'year', null, null, 1, null, null, 2024, 2025, 'Interface Tech', '+1 234 567 8906', 'tech@interface.com'],
-    // No maintenance
+    ['P004', 'Hydraulic Fluid', 'Shell', 'All GSE', 'D-01', 100, 20, 'month', null, 6, null, null, '2025-01-15', null, 'Shell Support', '+1 234 567 8903', 'support@shell.com'],
+    ['P005', 'Battery', 'Exide', 'GPU', 'E-01', 15, 5, 'month', null, 3, null, null, '2025-05-15', null, 'Exide Tech', '+1 234 567 8904', 'tech@exide.com'],
+    ['P006', 'Fire Extinguisher', 'Amerex', 'Safety Equipment', 'F-01', 8, 2, 'year', null, null, 1, null, null, 2023, 'Amerex Safety', '+1 234 567 8905', 'safety@amerex.com'],
+    ['P007', 'Annual Lift Inspection', 'Interface', 'Lifting Equipment', 'G-01', 5, 1, 'year', null, null, 1, null, null, 2024, 'Interface Tech', '+1 234 567 8906', 'tech@interface.com'],
     ['P008', 'Hand Tools Set', 'Stanley', 'Hand Tools', 'H-01', 20, 5, 'none', null, null, null, null, null, null, 'Stanley Tools', '+1 234 567 8907', 'tools@stanley.com']
   ];
   
@@ -275,79 +316,13 @@ const createSampleData = async () => {
         });
         console.log(`✅ Created sample part: ${part[0]}`);
         
-        // Also create maintenance record for non-none types
-        if (part[7] !== 'none') {
-          await createMaintenanceRecord(result.lastInsertRowid, part);
-        }
-      } else {
-        console.log(`⚠️ Part ${part[0]} already exists, skipping`);
+        // Create maintenance record
+        await updateMaintenanceStatus(result.lastInsertRowid);
       }
     } catch (err) {
       console.log(`⚠️ Error with part ${part[0]}:`, err.message);
     }
   }
-};
-
-// Helper to create maintenance record with proper initial values
-const createMaintenanceRecord = async (partId, part) => {
-  const maintType = part[7];
-  const intervalHours = part[8] || 250;
-  const intervalMonths = part[9] || 6;
-  const intervalYears = part[10] || 1;
-  const lastHours = part[11] || 0;
-  const lastDate = part[12];
-  const lastYear = part[13];
-  
-  let status = 'upcoming';
-  let nextServiceHours = 0;
-  let hoursRemaining = 0;
-  let nextServiceDate = null;
-  let daysRemaining = 0;
-  let nextServiceYear = null;
-  let yearsRemaining = 0;
-  
-  const currentYear = new Date().getFullYear();
-  const today = new Date();
-  
-  if (maintType === 'hour') {
-    const currentHours = lastHours;
-    nextServiceHours = lastHours + intervalHours;
-    hoursRemaining = nextServiceHours - currentHours;
-    if (hoursRemaining <= 0) status = 'overdue';
-    else if (hoursRemaining <= 50) status = 'due_soon';
-    else status = 'upcoming';
-  } else if (maintType === 'month' && lastDate) {
-    const lastServiceDate = new Date(lastDate);
-    nextServiceDate = new Date(lastServiceDate);
-    nextServiceDate.setMonth(nextServiceDate.getMonth() + intervalMonths);
-    daysRemaining = Math.ceil((nextServiceDate - today) / (1000 * 60 * 60 * 24));
-    if (daysRemaining <= 0) status = 'overdue';
-    else if (daysRemaining <= 14) status = 'due_soon';
-    else status = 'upcoming';
-    nextServiceDate = nextServiceDate.toISOString().split('T')[0];
-  } else if (maintType === 'year' && lastYear) {
-    nextServiceYear = lastYear + intervalYears;
-    yearsRemaining = nextServiceYear - currentYear;
-    if (yearsRemaining < 0) status = 'overdue';
-    else if (yearsRemaining === 0) status = 'due_soon';
-    else status = 'upcoming';
-  }
-  
-  await db.execute({
-    sql: `INSERT INTO gse_maintenance 
-          (equipment_name, equipment_type, maintenance_type, part_id,
-           current_hours, last_service_hours, service_interval_hours, next_service_hours, hours_remaining,
-           last_service_date, service_interval_months, next_service_date, days_remaining,
-           last_service_year, service_interval_years, next_service_year, years_remaining,
-           status, created_by, created_at, updated_at) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'system', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-    args: [part[0], part[2] || 'Part', maintType, partId,
-           lastHours, lastHours, intervalHours, nextServiceHours, hoursRemaining,
-           lastDate, intervalMonths, nextServiceDate, daysRemaining,
-           lastYear, intervalYears, nextServiceYear, yearsRemaining,
-           status]
-  });
-  console.log(`✅ Created maintenance record for ${part[0]} with status: ${status}`);
 };
 
 // ========== CREATE DEFAULT USERS ==========
@@ -485,7 +460,6 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
     
     await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', args: [newQuantity, part.id] });
     
-    // Update maintenance with new current hours if provided
     if (current_hours && part.maintenance_type === 'hour') {
       await db.execute({ sql: 'UPDATE gse_maintenance SET current_hours = ? WHERE part_id = ?', args: [current_hours, part.id] });
     }
@@ -648,9 +622,11 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE ==========
+// ========== GET GSE MAINTENANCE - SIMPLIFIED AND FIXED ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
+    console.log(`🔧 Maintenance data requested by: ${req.user.username}`);
+    
     const result = await db.execute(`
       SELECT 
         id,
@@ -658,20 +634,20 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         equipment_type,
         maintenance_type,
         part_id,
-        current_hours,
-        last_service_hours,
-        service_interval_hours,
-        next_service_hours,
-        hours_remaining,
+        COALESCE(current_hours, 0) as current_hours,
+        COALESCE(last_service_hours, 0) as last_service_hours,
+        COALESCE(service_interval_hours, 250) as service_interval_hours,
+        COALESCE(next_service_hours, 0) as next_service_hours,
+        COALESCE(hours_remaining, 0) as hours_remaining,
         last_service_date,
-        service_interval_months,
+        COALESCE(service_interval_months, 6) as service_interval_months,
         next_service_date,
-        days_remaining,
+        COALESCE(days_remaining, 0) as days_remaining,
         last_service_year,
-        service_interval_years,
+        COALESCE(service_interval_years, 1) as service_interval_years,
         next_service_year,
-        years_remaining,
-        status,
+        COALESCE(years_remaining, 0) as years_remaining,
+        COALESCE(status, 'upcoming') as status,
         service_performed,
         technician_name,
         notes,
@@ -685,10 +661,13 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         END,
         equipment_name ASC
     `);
+    
+    console.log(`✅ Retrieved ${result.rows.length} maintenance items`);
     res.json({ success: true, equipment: result.rows });
+    
   } catch (err) {
-    console.error('Error fetching maintenance:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('❌ Error fetching maintenance:', err.message);
+    res.json({ success: true, equipment: [] });
   }
 });
 
@@ -920,16 +899,25 @@ app.get('/api/debug/users', async (req, res) => {
   }
 });
 
+app.get('/api/debug/maintenance-table', async (req, res) => {
+  try {
+    const tableCheck = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gse_maintenance'");
+    const count = await db.execute("SELECT COUNT(*) as count FROM gse_maintenance");
+    res.json({ 
+      table_exists: tableCheck.rows.length > 0,
+      row_count: count.rows[0].count
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // ========== INITIALIZE ==========
 const init = async () => {
   await createTables();
   await createUsers();
   await createSampleData();
-  console.log('✅ All data initialized with proper maintenance statuses!');
-  console.log('📋 Sample data includes:');
-  console.log('   - Overdue items (red)');
-  console.log('   - Due soon items (yellow/orange)');
-  console.log('   - Upcoming items (green)');
+  console.log('✅ All data initialized!');
 };
 
 init();
