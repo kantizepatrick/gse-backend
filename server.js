@@ -30,6 +30,21 @@ app.use(cors({
 
 app.use(express.json());
 
+// Helper function to convert BigInt to Number for JSON serialization
+const convertBigInt = (obj) => {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'bigint') return Number(obj);
+  if (Array.isArray(obj)) return obj.map(convertBigInt);
+  if (typeof obj === 'object') {
+    const newObj = {};
+    for (const key in obj) {
+      newObj[key] = convertBigInt(obj[key]);
+    }
+    return newObj;
+  }
+  return obj;
+};
+
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
@@ -151,9 +166,9 @@ const calculateAndUpdateStatus = async (maintenanceId) => {
     let remainingValue = 0;
     
     if (maintType === 'hour') {
-      const currentHours = maint.current_hours || 0;
-      const lastServiceHours = maint.last_service_hours || 0;
-      const interval = maint.service_interval_hours || 250;
+      const currentHours = Number(maint.current_hours) || 0;
+      const lastServiceHours = Number(maint.last_service_hours) || 0;
+      const interval = Number(maint.service_interval_hours) || 250;
       const nextDue = lastServiceHours + interval;
       remainingValue = nextDue - currentHours;
       
@@ -173,7 +188,7 @@ const calculateAndUpdateStatus = async (maintenanceId) => {
       });
     } else if (maintType === 'month') {
       const lastDate = maint.last_service_date ? new Date(maint.last_service_date) : new Date();
-      const interval = maint.service_interval_months || 6;
+      const interval = Number(maint.service_interval_months) || 6;
       const nextDate = new Date(lastDate);
       nextDate.setMonth(nextDate.getMonth() + interval);
       const today = new Date();
@@ -194,8 +209,8 @@ const calculateAndUpdateStatus = async (maintenanceId) => {
         args: [nextDate.toISOString().split('T')[0], remainingValue, newStatus, maintenanceId]
       });
     } else if (maintType === 'year') {
-      const lastYear = maint.last_service_year || new Date().getFullYear();
-      const interval = maint.service_interval_years || 1;
+      const lastYear = Number(maint.last_service_year) || new Date().getFullYear();
+      const interval = Number(maint.service_interval_years) || 1;
       const nextYear = lastYear + interval;
       const currentYear = new Date().getFullYear();
       remainingValue = nextYear - currentYear;
@@ -216,7 +231,7 @@ const calculateAndUpdateStatus = async (maintenanceId) => {
       });
     }
     
-    console.log(`✅ Status updated for ${maint.equipment_name}: ${newStatus} (${remainingValue} remaining)`);
+    console.log(`✅ Status updated for ${maint.equipment_name}: ${newStatus}`);
     return newStatus;
   } catch (err) {
     console.error('Error calculating status:', err.message);
@@ -238,8 +253,8 @@ const syncPartToMaintenance = async (partId) => {
     const existingMaint = await db.execute({ sql: 'SELECT id FROM gse_maintenance WHERE part_id = ?', args: [partId] });
     
     let status = 'upcoming';
-    let currentHours = part.last_service_hours || 0;
-    let intervalHours = part.service_interval_hours || 250;
+    let currentHours = Number(part.last_service_hours) || 0;
+    let intervalHours = Number(part.service_interval_hours) || 250;
     let nextServiceHours = currentHours + intervalHours;
     let hoursRemaining = nextServiceHours - currentHours;
     
@@ -274,7 +289,7 @@ const syncPartToMaintenance = async (partId) => {
         args: [part.part_number, part.description || 'Part', maintType, partId,
                currentHours, currentHours, intervalHours, nextServiceHours, hoursRemaining, status]
       });
-      await calculateAndUpdateStatus(result.lastInsertRowid);
+      await calculateAndUpdateStatus(Number(result.lastInsertRowid));
     }
     console.log(`✅ Part ${part.part_number} synced to maintenance with status: ${status}`);
   } catch (err) {
@@ -308,14 +323,13 @@ const createSampleData = async () => {
           args: part
         });
         console.log(`✅ Created sample part: ${part[0]}`);
-        await syncPartToMaintenance(result.lastInsertRowid);
+        await syncPartToMaintenance(Number(result.lastInsertRowid));
       }
     } catch (err) {
       console.log(`⚠️ Error with part ${part[0]}:`, err.message);
     }
   }
   
-  // Create standalone equipment (not linked to parts)
   const standaloneEquipment = [
     ['Tow Tractor #5', 'Tow Tractor', 'hour', 250, 1250, 'overdue'],
     ['GPU Unit #2', 'GPU', 'hour', 200, 950, 'due_soon'],
@@ -382,8 +396,15 @@ app.post('/api/login', async (req, res) => {
     
     const user = result.rows[0];
     if (bcrypt.compareSync(password, user.password_hash)) {
-      const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
-      res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } });
+      const token = jwt.sign({ id: Number(user.id), username: user.username, role: user.role }, SECRET_KEY);
+      const responseUser = {
+        id: Number(user.id),
+        username: user.username,
+        full_name: user.full_name,
+        role: user.role,
+        email: user.email
+      };
+      res.json({ token, user: responseUser });
     } else {
       res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -396,7 +417,8 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/parts', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
-    res.json(result.rows);
+    const convertedData = convertBigInt(result.rows);
+    res.json(convertedData);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -424,7 +446,7 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
     });
     
     console.log(`✅ Part created: ${part_number}`);
-    await syncPartToMaintenance(result.lastInsertRowid);
+    await syncPartToMaintenance(Number(result.lastInsertRowid));
     
     res.json({ message: 'Part added successfully and synced to maintenance schedule!' });
   } catch (err) {
@@ -464,7 +486,7 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
     }
     
     const part = partResult.rows[0];
-    const newQuantity = part.quantity_on_hand + receiveQty;
+    const newQuantity = Number(part.quantity_on_hand) + receiveQty;
     
     await db.execute({ 
       sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) 
@@ -478,7 +500,7 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
       await db.execute({ sql: 'UPDATE gse_maintenance SET current_hours = ? WHERE part_id = ?', args: [current_hours, part.id] });
       const maintResult = await db.execute({ sql: 'SELECT id FROM gse_maintenance WHERE part_id = ?', args: [part.id] });
       if (maintResult.rows.length > 0) {
-        await calculateAndUpdateStatus(maintResult.rows[0].id);
+        await calculateAndUpdateStatus(Number(maintResult.rows[0].id));
       }
     }
     
@@ -531,8 +553,9 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         equipment_name ASC
     `);
     
-    console.log(`✅ Retrieved ${result.rows.length} maintenance items`);
-    res.json({ success: true, equipment: result.rows });
+    const convertedData = convertBigInt(result.rows);
+    console.log(`✅ Retrieved ${convertedData.length} maintenance items`);
+    res.json({ success: true, equipment: convertedData });
   } catch (err) {
     console.error('❌ Error fetching maintenance:', err.message);
     res.json({ success: true, equipment: [] });
@@ -562,9 +585,9 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
       args: [equipment_name, equipment_type || '', maintenance_type, currentValue, currentValue, interval, status, notes || '', req.user.username]
     });
     
-    await calculateAndUpdateStatus(result.lastInsertRowid);
+    await calculateAndUpdateStatus(Number(result.lastInsertRowid));
     
-    res.json({ success: true, message: 'Equipment added to maintenance schedule', id: result.lastInsertRowid });
+    res.json({ success: true, message: 'Equipment added to maintenance schedule', id: Number(result.lastInsertRowid) });
   } catch (err) {
     console.error('Add equipment error:', err.message);
     res.status(500).json({ error: err.message });
@@ -627,11 +650,11 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     }
     
     // Recalculate status after service
-    await calculateAndUpdateStatus(id);
+    await calculateAndUpdateStatus(Number(id));
     
     // If linked to a part, also update the part
     if (maint.part_id) {
-      await syncPartToMaintenance(maint.part_id);
+      await syncPartToMaintenance(Number(maint.part_id));
     }
     
     res.json({ success: true, message: 'Service recorded successfully! Status updated.' });
@@ -652,7 +675,7 @@ app.put('/api/gse-maintenance/:id/usage', authenticateToken, async (req, res) =>
       args: [current_hours, id]
     });
     
-    await calculateAndUpdateStatus(id);
+    await calculateAndUpdateStatus(Number(id));
     
     res.json({ success: true, message: 'Usage updated, status recalculated' });
   } catch (err) {
@@ -691,7 +714,7 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
     }
     
     const part = partResult.rows[0];
-    if (part.quantity_on_hand < requestQty) {
+    if (Number(part.quantity_on_hand) < requestQty) {
       return res.status(400).json({ error: 'Insufficient stock available' });
     }
     
@@ -723,7 +746,8 @@ app.get('/api/requests/pending', authenticateToken, async (req, res) => {
       WHERE p.status = 'pending'
       ORDER BY p.created_at DESC
     `);
-    res.json({ success: true, requests: result.rows });
+    const convertedData = convertBigInt(result.rows);
+    res.json({ success: true, requests: convertedData });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -756,7 +780,7 @@ app.post('/api/requests/:id/approve', authenticateToken, async (req, res) => {
       args: [request.part_id] 
     });
     
-    const currentStock = partResult.rows[0].quantity_on_hand;
+    const currentStock = Number(partResult.rows[0].quantity_on_hand);
     const newStock = currentStock - requestQty;
     
     if (currentStock < requestQty) {
@@ -818,7 +842,8 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
             LIMIT 50`, 
       args: [req.user.id] 
     });
-    res.json({ success: true, requests: result.rows });
+    const convertedData = convertBigInt(result.rows);
+    res.json({ success: true, requests: convertedData });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -834,7 +859,8 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
       ORDER BY t.created_at DESC 
       LIMIT 50
     `);
-    res.json(result.rows);
+    const convertedData = convertBigInt(result.rows);
+    res.json(convertedData);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -848,7 +874,8 @@ app.get('/api/reports/low-stock', authenticateToken, async (req, res) => {
       FROM parts 
       WHERE quantity_on_hand <= min_stock
     `);
-    res.json(result.rows);
+    const convertedData = convertBigInt(result.rows);
+    res.json(convertedData);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -859,7 +886,8 @@ app.get('/api/users', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     const result = await db.execute('SELECT id, username, full_name, role, email FROM users');
-    res.json(result.rows);
+    const convertedData = convertBigInt(result.rows);
+    res.json(convertedData);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -882,7 +910,7 @@ app.post('/api/users', authenticateToken, async (req, res) => {
 
 app.delete('/api/users/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  if (req.params.id == req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
+  if (Number(req.params.id) === Number(req.user.id)) return res.status(400).json({ error: 'Cannot delete your own account' });
   try {
     await db.execute({ sql: 'DELETE FROM users WHERE id = ?', args: [req.params.id] });
     res.json({ message: 'User deleted successfully' });
@@ -994,7 +1022,8 @@ app.post('/api/reset-password', async (req, res) => {
 app.get('/api/debug/users', async (req, res) => {
   try {
     const result = await db.execute('SELECT id, username, role FROM users');
-    res.json({ users: result.rows });
+    const convertedData = convertBigInt(result.rows);
+    res.json({ users: convertedData });
   } catch (err) {
     res.json({ error: err.message });
   }
@@ -1005,7 +1034,7 @@ const init = async () => {
   await createTables();
   await createUsers();
   await createSampleData();
-  console.log('✅ All data initialized - Dashboard will auto-update with maintenance status!');
+  console.log('✅ All data initialized - BigInt conversion enabled!');
 };
 
 init();
@@ -1017,8 +1046,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔄 Auto-sync Features:`);
-  console.log(`   - Record service → Auto-updates status (overdue/due_soon/upcoming)`);
-  console.log(`   - Update usage hours → Auto-recalculates remaining time`);
-  console.log(`   - Dashboard reflects changes immediately`);
+  console.log(`\n🔄 Features:`);
+  console.log(`   - BigInt values automatically converted to Numbers`);
+  console.log(`   - Maintenance schedule auto-updates dashboard status`);
 });
