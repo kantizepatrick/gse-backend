@@ -477,7 +477,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE (FIXED VERSION) ==========
+// ========== GET GSE MAINTENANCE (FIXED) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY equipment_name`);
@@ -548,23 +548,113 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECORD SERVICE ==========
+// ========== RECORD SERVICE (FULLY FIXED) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { service_performed, technician_name, notes, current_hours } = req.body;
+  const { 
+    service_performed, 
+    technician_name, 
+    notes, 
+    current_hours,
+    service_interval_hours,
+    service_interval_months,
+    service_interval_years
+  } = req.body;
   
   try {
-    await db.execute({ 
-      sql: `UPDATE gse_maintenance 
-            SET service_performed = ?, technician_name = ?, notes = ?, 
-                last_service_hours = COALESCE(?, last_service_hours),
-                current_hours = COALESCE(?, current_hours),
-                date_performed = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?`, 
-      args: [service_performed, technician_name, notes, current_hours || null, current_hours || null, id] 
+    const equipmentResult = await db.execute({ 
+      sql: 'SELECT maintenance_type FROM gse_maintenance WHERE id = ?', 
+      args: [id] 
     });
-    res.json({ success: true, message: 'Service recorded successfully' });
+    
+    if (equipmentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    
+    const maintenanceType = equipmentResult.rows[0].maintenance_type;
+    let updateQuery = '';
+    let updateArgs = [];
+    
+    if (maintenanceType === 'hour') {
+      const newLastServiceHours = current_hours ? parseInt(current_hours) : 0;
+      const newInterval = service_interval_hours ? parseInt(service_interval_hours) : 250;
+      
+      updateQuery = `UPDATE gse_maintenance 
+                     SET service_performed = ?, 
+                         technician_name = ?, 
+                         notes = ?,
+                         last_service_hours = ?,
+                         current_hours = ?,
+                         service_interval_hours = ?,
+                         date_performed = CURRENT_TIMESTAMP, 
+                         updated_at = CURRENT_TIMESTAMP,
+                         status = 'upcoming'
+                     WHERE id = ?`;
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        newLastServiceHours,
+        newLastServiceHours,
+        newInterval,
+        id
+      ];
+      
+    } else if (maintenanceType === 'month') {
+      const today = new Date().toISOString().split('T')[0];
+      const newInterval = service_interval_months ? parseInt(service_interval_months) : 6;
+      
+      updateQuery = `UPDATE gse_maintenance 
+                     SET service_performed = ?, 
+                         technician_name = ?, 
+                         notes = ?,
+                         last_service_date = ?,
+                         service_interval_months = ?,
+                         date_performed = CURRENT_TIMESTAMP, 
+                         updated_at = CURRENT_TIMESTAMP,
+                         status = 'upcoming'
+                     WHERE id = ?`;
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        today,
+        newInterval,
+        id
+      ];
+      
+    } else if (maintenanceType === 'year') {
+      const currentYear = new Date().getFullYear();
+      const newInterval = service_interval_years ? parseInt(service_interval_years) : 1;
+      
+      updateQuery = `UPDATE gse_maintenance 
+                     SET service_performed = ?, 
+                         technician_name = ?, 
+                         notes = ?,
+                         last_service_year = ?,
+                         service_interval_years = ?,
+                         date_performed = CURRENT_TIMESTAMP, 
+                         updated_at = CURRENT_TIMESTAMP,
+                         status = 'upcoming'
+                     WHERE id = ?`;
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        currentYear,
+        newInterval,
+        id
+      ];
+      
+    } else {
+      return res.status(400).json({ error: 'Unsupported maintenance type' });
+    }
+    
+    await db.execute({ sql: updateQuery, args: updateArgs });
+    res.json({ success: true, message: 'Service recorded successfully!' });
+    
   } catch (err) {
+    console.error('Service recording error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -776,8 +866,4 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Integrated Features:`);
-  console.log(`   - Parts added via Receive Parts appear in Maintenance`);
-  console.log(`   - Maintenance type selected in Receive Parts is preserved`);
-  console.log(`   - Maintenance schedule shows both GSE equipment and Parts`);
 });
