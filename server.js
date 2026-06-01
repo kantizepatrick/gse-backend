@@ -253,6 +253,70 @@ const calculateHourBasedMaintenance = (lastServiceDate, serviceIntervalHours) =>
   };
 };
 
+// ========== HELPER: CALCULATE MONTHS (7 DAYS = 1 WEEK THRESHOLD) ==========
+const calculateMonthBasedMaintenance = (lastServiceDate, serviceIntervalMonths) => {
+  if (!lastServiceDate) {
+    return { days_remaining: serviceIntervalMonths * 30, status: 'upcoming', nextDueDate: null };
+  }
+  
+  const lastDate = new Date(lastServiceDate);
+  const nextDate = new Date(lastDate);
+  nextDate.setMonth(nextDate.getMonth() + serviceIntervalMonths);
+  const today = new Date();
+  
+  // Calculate days remaining
+  const daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
+  const days_remaining = daysRemaining > 0 ? daysRemaining : 0;
+  
+  // Calculate weeks remaining
+  const weeks_remaining = days_remaining / 7;
+  
+  // Determine status based on 7 days (1 week) threshold
+  let status = 'upcoming';
+  if (daysRemaining <= 0) {
+    status = 'overdue';
+  } else if (daysRemaining <= 7) {  // 7 days = 1 week
+    status = 'due_soon';
+  } else {
+    status = 'upcoming';
+  }
+  
+  return { 
+    days_remaining,
+    weeks_remaining,
+    status,
+    nextDueDate: nextDate.toLocaleDateString()
+  };
+};
+
+// ========== HELPER: CALCULATE YEARS ==========
+const calculateYearBasedMaintenance = (lastServiceYear, serviceIntervalYears) => {
+  if (!lastServiceYear) {
+    return { years_remaining: serviceIntervalYears, status: 'upcoming', nextDueDate: null };
+  }
+  
+  const nextYear = lastServiceYear + serviceIntervalYears;
+  const currentYear = new Date().getFullYear();
+  const yearsRemaining = nextYear - currentYear;
+  const years_remaining = yearsRemaining > 0 ? yearsRemaining : 0;
+  
+  // Determine status
+  let status = 'upcoming';
+  if (yearsRemaining < 0) {
+    status = 'overdue';
+  } else if (yearsRemaining === 0) {
+    status = 'due_soon';
+  } else {
+    status = 'upcoming';
+  }
+  
+  return { 
+    years_remaining,
+    status,
+    nextDueDate: nextYear.toString()
+  };
+};
+
 // ========== LOGIN ==========
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
@@ -515,7 +579,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE (WITH 10 HOURS/DAY CALCULATION) ==========
+// ========== GET GSE MAINTENANCE (WITH CALCULATIONS) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY equipment_name`);
@@ -525,12 +589,13 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       let hours_remaining = null;
       let days_remaining = null;
       let years_remaining = null;
+      let weeks_remaining = null;
       let remaining_value = null;
       let current_hours_display = null;
       let next_due_display = null;
       
       if (item.maintenance_type === 'hour' && item.service_interval_hours) {
-        // CALCULATE HOURS BASED ON 10 HOURS PER DAY FROM LAST SERVICE DATE
+        // HOUR-BASED: 10 hours per day, 50 hours threshold
         const calculation = calculateHourBasedMaintenance(item.last_service_date, item.service_interval_hours);
         current_hours_display = calculation.current_hours;
         hours_remaining = calculation.hours_remaining;
@@ -539,33 +604,22 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         next_due_display = calculation.nextDueDate;
         
       } else if (item.maintenance_type === 'month' && item.service_interval_months) {
-        if (item.last_service_date) {
-          const lastDate = new Date(item.last_service_date);
-          const nextDate = new Date(lastDate);
-          nextDate.setMonth(nextDate.getMonth() + item.service_interval_months);
-          const today = new Date();
-          const daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
-          days_remaining = daysRemaining > 0 ? daysRemaining : 0;
-          remaining_value = days_remaining;
-          next_due_display = nextDate.toLocaleDateString();
-          
-          if (daysRemaining < 0) status = 'overdue';
-          else if (daysRemaining <= 14) status = 'due_soon';
-          else status = 'upcoming';
-        }
+        // MONTH-BASED: 7 days (1 week) threshold
+        const calculation = calculateMonthBasedMaintenance(item.last_service_date, item.service_interval_months);
+        days_remaining = calculation.days_remaining;
+        weeks_remaining = calculation.weeks_remaining;
+        remaining_value = days_remaining;
+        status = calculation.status;
+        next_due_display = calculation.nextDueDate;
         
       } else if (item.maintenance_type === 'year' && item.service_interval_years) {
+        // YEAR-BASED
         const lastYear = item.last_service_year || new Date().getFullYear();
-        const nextYear = lastYear + item.service_interval_years;
-        const currentYear = new Date().getFullYear();
-        const yearsRemaining = nextYear - currentYear;
-        years_remaining = yearsRemaining > 0 ? yearsRemaining : 0;
+        const calculation = calculateYearBasedMaintenance(lastYear, item.service_interval_years);
+        years_remaining = calculation.years_remaining;
         remaining_value = years_remaining;
-        next_due_display = nextYear.toString();
-        
-        if (yearsRemaining < 0) status = 'overdue';
-        else if (yearsRemaining === 0) status = 'due_soon';
-        else status = 'upcoming';
+        status = calculation.status;
+        next_due_display = calculation.nextDueDate;
         
       } else if (item.maintenance_type === 'none') {
         status = 'no_maintenance';
@@ -577,6 +631,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         status,
         hours_remaining,
         days_remaining,
+        weeks_remaining,
         years_remaining,
         remaining_value,
         current_hours: current_hours_display !== null ? current_hours_display : item.current_hours,
@@ -591,7 +646,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECORD SERVICE (WITH DATE TRACKING) ==========
+// ========== RECORD SERVICE ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -621,7 +676,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     if (maintenanceType === 'hour') {
       const newInterval = service_interval_hours ? parseInt(service_interval_hours) : 250;
       
-      // Save the service date - hours will be calculated automatically from this date
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
@@ -691,7 +745,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     }
     
     await db.execute({ sql: updateQuery, args: updateArgs });
-    res.json({ success: true, message: 'Service recorded successfully! Hours will be calculated automatically from today.' });
+    res.json({ success: true, message: 'Service recorded successfully!' });
     
   } catch (err) {
     console.error('Service recording error:', err.message);
@@ -894,7 +948,9 @@ const init = async () => {
   await createTables();
   await createUsers();
   await createSampleData();
-  console.log('✅ All data initialized - Hour calculation enabled (10 hours/day)');
+  console.log('✅ All data initialized');
+  console.log('📅 Month-based: 7 days (1 week) threshold for Due Soon');
+  console.log('⏱️ Hour-based: 50 hours threshold for Due Soon');
 };
 
 init();
@@ -906,10 +962,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Hour Calculation (10 hours per day):`);
-  console.log(`   - Hours are calculated automatically from last service date`);
-  console.log(`   - Current hours = days since service × 10`);
-  console.log(`   - Remaining hours = interval - current hours`);
-  console.log(`   - Due Soon: ≤ 50 hours remaining`);
-  console.log(`   - Overdue: 0 or negative hours remaining`);
+  console.log(`\n🔧 Maintenance Thresholds:`);
+  console.log(`   ⏱️ Hour-based: Due Soon ≤ 50 hours, Overdue ≤ 0 hours`);
+  console.log(`   📅 Month-based: Due Soon ≤ 7 days (1 week), Overdue ≤ 0 days`);
+  console.log(`   📆 Year-based: Due Soon = 0 years, Overdue < 0 years`);
 });
