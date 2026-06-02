@@ -394,7 +394,6 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
         ]
       });
     } else {
-      // For no maintenance items, add to gse_maintenance without service date
       await db.execute({ 
         sql: `INSERT INTO gse_maintenance 
               (equipment_name, equipment_type, maintenance_type, part_id,
@@ -596,7 +595,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE (INCLUDING NO MAINTENANCE ITEMS) ==========
+// ========== GET GSE MAINTENANCE (WITH NEXT SERVICE COLUMN) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY 
@@ -619,13 +618,14 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       let daysOverdue = 0;
       let current_service_display = null;
       let next_service_display = null;
+      let next_service_column = null;
       
-      // Handle NO MAINTENANCE type
       if (item.maintenance_type === 'none') {
         status = 'no_maintenance';
         current_service_display = 'No maintenance required';
         next_service_display = 'Not applicable';
         next_due_display = 'No schedule';
+        next_service_column = '⚪ No maintenance required';
         
       } else if (item.maintenance_type === 'hour' && item.service_interval_hours) {
         const calculation = calculateHourStatus(item.last_service_date, item.service_interval_hours);
@@ -642,13 +642,18 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         }
         
         if (remaining_hours > 0) {
+          const daysLeft = Math.ceil(remaining_hours / 10);
+          next_service_column = `📅 ${next_due_display} (${remaining_hours} hours / ${daysLeft} days remaining)`;
           if (remaining_hours <= 40) {
             next_service_display = `⚠️ DUE SOON: ${remaining_hours} hours remaining (Due ${next_due_display})`;
           } else {
             next_service_display = `${remaining_hours} hours remaining (Due ${next_due_display})`;
           }
         } else if (remaining_hours <= 0) {
+          next_service_column = `🔴 OVERDUE by ${Math.abs(remaining_hours)} hours (Was due: ${next_due_display})`;
           next_service_display = `🔴 OVERDUE by ${Math.abs(remaining_hours)} hours (Was due ${next_due_display})`;
+        } else {
+          next_service_column = 'Schedule service';
         }
         
       } else if (item.maintenance_type === 'month' && item.service_interval_months) {
@@ -666,15 +671,21 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         }
         
         if (days_remaining > 0) {
+          const weeksLeft = (days_remaining / 7).toFixed(1);
+          next_service_column = `📅 ${next_due_display} (${days_remaining} days / ${weeksLeft} weeks remaining)`;
           if (days_remaining <= 4) {
             next_service_display = `⚠️ DUE SOON: ${days_remaining} days remaining (Due ${next_due_display})`;
           } else {
             next_service_display = `${days_remaining} days remaining (Due ${next_due_display})`;
           }
         } else if (days_remaining === 0) {
+          next_service_column = `⚠️ DUE TODAY: Service required today (${next_due_display})`;
           next_service_display = `⚠️ DUE TODAY: Service required today (${next_due_display})`;
         } else if (days_remaining < 0) {
+          next_service_column = `🔴 OVERDUE by ${Math.abs(days_remaining)} days (Was due: ${next_due_display})`;
           next_service_display = `🔴 OVERDUE by ${Math.abs(days_remaining)} days (Was due ${next_due_display})`;
+        } else {
+          next_service_column = 'Schedule service';
         }
         
       } else if (item.maintenance_type === 'year' && item.service_interval_years) {
@@ -691,10 +702,13 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         }
         
         if (years_remaining > 0) {
+          next_service_column = `📅 Year ${next_due_display} (${years_remaining} years remaining)`;
           next_service_display = `${years_remaining} years remaining (Due ${next_due_display})`;
         } else if (years_remaining === 0) {
+          next_service_column = `⚠️ DUE SOON: Service due this year (${next_due_display})`;
           next_service_display = `⚠️ DUE SOON: Service due this year (${next_due_display})`;
         } else {
+          next_service_column = `🔴 OVERDUE: Service was due in ${next_due_display}`;
           next_service_display = `🔴 OVERDUE: Service was due in ${next_due_display}`;
         }
       }
@@ -709,7 +723,8 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         next_due_display,
         daysOverdue,
         current_service_display,
-        next_service_display
+        next_service_display,
+        next_service_column
       };
     });
     
@@ -746,7 +761,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     const maintenanceType = equipmentResult.rows[0].maintenance_type;
     
-    // Don't allow service recording for no maintenance items
     if (maintenanceType === 'none') {
       return res.status(400).json({ error: 'This item requires no maintenance' });
     }
@@ -1067,7 +1081,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Status: SERVICED (green) | DUE SOON (yellow) | OVERDUE (red) | NO MAINTENANCE (gray)');
+  console.log('📅 Next Service column added - shows exact due dates and remaining time');
 };
 
 init();
@@ -1079,9 +1093,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Status Definitions:`);
-  console.log(`   ✅ SERVICED: Recently serviced, next service >4 days or >40 hours away`);
-  console.log(`   🟡 DUE SOON: Service needed within 4 days or 40 hours`);
-  console.log(`   🔴 OVERDUE: Service date has passed or hours exceeded`);
-  console.log(`   ⚪ NO MAINTENANCE: No scheduled maintenance required`);
+  console.log(`\n📊 New Column: Next Service - Shows exact due date and remaining time`);
 });
