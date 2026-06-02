@@ -210,82 +210,53 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ========== AUTOMATIC DAILY CALCULATION FUNCTIONS ==========
+// ========== CALCULATION FUNCTIONS - BASED ON ACTUAL DATES ==========
 
-const calculateHourStatus = (lastServiceDate, intervalHours, customLastServiceHours = null) => {
+// Calculate month-based maintenance (based on actual calendar dates)
+const calculateMonthStatus = (lastServiceDate, intervalDays) => {
   if (!lastServiceDate) {
-    return { current_hours: 0, remaining_hours: intervalHours, status: 'upcoming', nextDueDate: null, daysOverdue: 0 };
+    return { 
+      days_remaining: intervalDays, 
+      status: 'upcoming', 
+      nextDueDate: null, 
+      daysOverdue: 0,
+      nextServiceDate: null
+    };
   }
   
   const lastDate = new Date(lastServiceDate);
-  const today = new Date();
-  const daysSinceService = Math.floor((today - lastDate) / (1000 * 60 * 60 * 24));
-  
-  let current_hours;
-  if (customLastServiceHours !== null && customLastServiceHours > 0) {
-    current_hours = customLastServiceHours + (daysSinceService * 10);
-  } else {
-    current_hours = daysSinceService * 10;
-  }
-  
-  const remaining_hours = intervalHours - current_hours;
-  
-  const daysUntilDue = Math.ceil(remaining_hours / 10);
-  const nextDueDate = new Date(today);
-  nextDueDate.setDate(today.getDate() + daysUntilDue);
-  
-  let status = 'upcoming';
-  let daysOverdue = 0;
-  
-  if (remaining_hours <= 0) {
-    status = 'overdue';
-    daysOverdue = Math.abs(Math.floor(remaining_hours / 10));
-  } else if (remaining_hours <= 50) {
-    status = 'due_soon';
-  }
-  
-  return {
-    current_hours,
-    remaining_hours,
-    status,
-    nextDueDate: nextDueDate.toLocaleDateString(),
-    daysOverdue,
-    daysSinceService
-  };
-};
-
-const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
-  if (!lastServiceDate) {
-    return { days_remaining: intervalMonths * 30, status: 'upcoming', nextDueDate: null, daysOverdue: 0 };
-  }
-  
-  const lastDate = new Date(lastServiceDate);
+  // Add interval days to get next service date
   const nextDate = new Date(lastDate);
-  nextDate.setMonth(nextDate.getMonth() + intervalMonths);
-  const today = new Date();
+  nextDate.setDate(lastDate.getDate() + intervalDays);
   
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  // Calculate days remaining (actual calendar difference)
   const daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
-  const weeksRemaining = daysRemaining / 7;
   
   let status = 'upcoming';
   let daysOverdue = 0;
   
-  if (daysRemaining <= 0) {
+  if (daysRemaining < 0) {
     status = 'overdue';
     daysOverdue = Math.abs(daysRemaining);
-  } else if (daysRemaining <= 7) {
+  } else if (daysRemaining <= 4) {
     status = 'due_soon';
+  } else {
+    status = 'upcoming';
   }
   
   return {
     days_remaining: daysRemaining > 0 ? daysRemaining : 0,
-    weeks_remaining: weeksRemaining,
     status,
     nextDueDate: nextDate.toLocaleDateString(),
-    daysOverdue
+    daysOverdue,
+    nextServiceDate: nextDate
   };
 };
 
+// Calculate year-based maintenance
 const calculateYearStatus = (lastServiceYear, intervalYears) => {
   if (!lastServiceYear) {
     return { years_remaining: intervalYears, status: 'upcoming', nextDueDate: null };
@@ -306,6 +277,53 @@ const calculateYearStatus = (lastServiceYear, intervalYears) => {
     years_remaining: yearsRemaining > 0 ? yearsRemaining : 0,
     status,
     nextDueDate: nextYear.toString()
+  };
+};
+
+// Calculate hour-based maintenance (10 hours per day)
+const calculateHourStatus = (lastServiceDate, intervalHours) => {
+  if (!lastServiceDate) {
+    return { 
+      current_hours: 0, 
+      remaining_hours: intervalHours, 
+      status: 'upcoming', 
+      nextDueDate: null, 
+      daysOverdue: 0,
+      nextServiceDate: null
+    };
+  }
+  
+  const lastDate = new Date(lastServiceDate);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  const daysSinceService = Math.floor((today - lastDate) / (1000 * 60 * 60 * 24));
+  const current_hours = daysSinceService * 10;
+  const remaining_hours = intervalHours - current_hours;
+  
+  // Calculate next service date based on remaining hours (10 hours/day)
+  const daysUntilDue = Math.ceil(remaining_hours / 10);
+  const nextDate = new Date(today);
+  nextDate.setDate(today.getDate() + daysUntilDue);
+  
+  let status = 'upcoming';
+  let daysOverdue = 0;
+  
+  if (remaining_hours <= 0) {
+    status = 'overdue';
+    daysOverdue = Math.abs(Math.floor(remaining_hours / 10));
+  } else if (remaining_hours <= 40) {
+    status = 'due_soon';
+  }
+  
+  return {
+    current_hours,
+    remaining_hours: remaining_hours > 0 ? remaining_hours : 0,
+    status,
+    nextDueDate: nextDate.toLocaleDateString(),
+    daysOverdue,
+    daysSinceService,
+    nextServiceDate: nextDate
   };
 };
 
@@ -571,7 +589,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE ==========
+// ========== GET GSE MAINTENANCE (FIXED DATE CALCULATION) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY equipment_name`);
@@ -581,28 +599,65 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       let current_hours = null;
       let remaining_hours = null;
       let days_remaining = null;
-      let weeks_remaining = null;
       let years_remaining = null;
       let next_due_display = null;
       let daysOverdue = 0;
-      let daysSinceService = 0;
+      let current_service_display = null;
+      let next_service_display = null;
+      let nextServiceDateObj = null;
       
       if (item.maintenance_type === 'hour' && item.service_interval_hours) {
-        const calculation = calculateHourStatus(item.last_service_date, item.service_interval_hours, item.last_service_hours);
+        const calculation = calculateHourStatus(item.last_service_date, item.service_interval_hours);
         current_hours = calculation.current_hours;
         remaining_hours = calculation.remaining_hours;
         status = calculation.status;
         next_due_display = calculation.nextDueDate;
         daysOverdue = calculation.daysOverdue;
-        daysSinceService = calculation.daysSinceService;
+        nextServiceDateObj = calculation.nextServiceDate;
+        
+        if (item.last_service_date) {
+          current_service_display = `${item.last_service_date} (${current_hours} hrs used)`;
+        } else {
+          current_service_display = 'Not recorded';
+        }
+        
+        if (remaining_hours > 0) {
+          if (remaining_hours <= 40) {
+            next_service_display = `⚠️ DUE SOON: ${remaining_hours} hours remaining (Due ${next_due_display})`;
+          } else {
+            next_service_display = `${remaining_hours} hours remaining (Due ${next_due_display})`;
+          }
+        } else if (remaining_hours <= 0) {
+          next_service_display = `🔴 OVERDUE by ${Math.abs(remaining_hours)} hours (Was due ${next_due_display})`;
+        }
         
       } else if (item.maintenance_type === 'month' && item.service_interval_months) {
-        const calculation = calculateMonthStatus(item.last_service_date, item.service_interval_months);
+        // For month-based, interval is in months
+        const intervalDays = item.service_interval_months * 30;
+        const calculation = calculateMonthStatus(item.last_service_date, intervalDays);
         days_remaining = calculation.days_remaining;
-        weeks_remaining = calculation.weeks_remaining;
         status = calculation.status;
         next_due_display = calculation.nextDueDate;
         daysOverdue = calculation.daysOverdue;
+        nextServiceDateObj = calculation.nextServiceDate;
+        
+        if (item.last_service_date) {
+          current_service_display = item.last_service_date;
+        } else {
+          current_service_display = 'Not recorded';
+        }
+        
+        if (days_remaining > 0) {
+          if (days_remaining <= 4) {
+            next_service_display = `⚠️ DUE SOON: ${days_remaining} days remaining (Due ${next_due_display})`;
+          } else {
+            next_service_display = `${days_remaining} days remaining (Due ${next_due_display})`;
+          }
+        } else if (days_remaining === 0) {
+          next_service_display = `⚠️ DUE TODAY: Service required today (${next_due_display})`;
+        } else if (days_remaining < 0) {
+          next_service_display = `🔴 OVERDUE by ${Math.abs(days_remaining)} days (Was due ${next_due_display})`;
+        }
         
       } else if (item.maintenance_type === 'year' && item.service_interval_years) {
         const lastYear = item.last_service_year || new Date().getFullYear();
@@ -610,6 +665,20 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         years_remaining = calculation.years_remaining;
         status = calculation.status;
         next_due_display = calculation.nextDueDate;
+        
+        if (item.last_service_year) {
+          current_service_display = item.last_service_year.toString();
+        } else {
+          current_service_display = 'Not recorded';
+        }
+        
+        if (years_remaining > 0) {
+          next_service_display = `${years_remaining} years remaining (Due ${next_due_display})`;
+        } else if (years_remaining === 0) {
+          next_service_display = `⚠️ DUE SOON: Service due this year (${next_due_display})`;
+        } else {
+          next_service_display = `🔴 OVERDUE: Service was due in ${next_due_display}`;
+        }
       }
       
       return {
@@ -618,11 +687,11 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         current_hours,
         remaining_hours,
         days_remaining,
-        weeks_remaining,
         years_remaining,
         next_due_display,
         daysOverdue,
-        daysSinceService
+        current_service_display,
+        next_service_display
       };
     });
     
@@ -633,7 +702,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECORD SERVICE (WITH CUSTOM DATE AND HOURS) ==========
+// ========== RECORD SERVICE ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -668,13 +737,8 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     if (maintenanceType === 'hour') {
       const newInterval = service_interval_hours ? parseInt(service_interval_hours) : 250;
-      let customHours = null;
       
       if (custom_current_hours !== undefined && custom_current_hours !== '') {
-        customHours = parseInt(custom_current_hours);
-      }
-      
-      if (customHours !== null) {
         updateQuery = `UPDATE gse_maintenance 
                        SET service_performed = ?, 
                            technician_name = ?, 
@@ -691,7 +755,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
           technician_name || '', 
           notes || '', 
           serviceDate,
-          customHours,
+          parseInt(custom_current_hours),
           newInterval,
           id
         ];
@@ -979,7 +1043,8 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Service Recording: Custom date and hours supported');
+  console.log('📅 Date-based calculation: Next service = Last service date + Interval days');
+  console.log('⚠️ Due Soon: 4 days before next service date');
 };
 
 init();
@@ -991,4 +1056,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
+  console.log(`\n🔧 How it works:`);
+  console.log(`   📅 Month-based: Next service = Last service date + Interval days`);
+  console.log(`   ⏱️ Hour-based: Next service = Today + (Remaining hours ÷ 10) days`);
+  console.log(`   ⚠️ Due Soon: 4 days before next service date`);
 });
