@@ -117,7 +117,7 @@ const createTables = async () => {
       technician_name TEXT,
       notes TEXT,
       date_performed DATETIME DEFAULT CURRENT_TIMESTAMP,
-      status TEXT DEFAULT 'upcoming',
+      status TEXT DEFAULT 'serviced',
       created_by TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -169,7 +169,7 @@ const createSampleData = async () => {
     if (existing.rows.length === 0) {
       await db.execute({
         sql: `INSERT INTO gse_maintenance (equipment_name, equipment_type, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, last_service_date, status, created_by)
-              VALUES (?, ?, ?, ?, ?, ?, ?, 'upcoming', 'system')`,
+              VALUES (?, ?, ?, ?, ?, ?, ?, 'serviced', 'system')`,
         args: [eq[0], eq[1], eq[2], eq[2] === 'hour' ? eq[3] : null, eq[2] === 'month' ? eq[3] : null, eq[2] === 'year' ? eq[3] : null, eq[6]]
       });
       console.log(`✅ Created sample GSE: ${eq[0]}`);
@@ -210,14 +210,13 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ========== CALCULATION FUNCTIONS - BASED ON ACTUAL DATES ==========
+// ========== CALCULATION FUNCTIONS ==========
 
-// Calculate month-based maintenance (based on actual calendar dates)
 const calculateMonthStatus = (lastServiceDate, intervalDays) => {
   if (!lastServiceDate) {
     return { 
       days_remaining: intervalDays, 
-      status: 'upcoming', 
+      status: 'serviced', 
       nextDueDate: null, 
       daysOverdue: 0,
       nextServiceDate: null
@@ -225,17 +224,15 @@ const calculateMonthStatus = (lastServiceDate, intervalDays) => {
   }
   
   const lastDate = new Date(lastServiceDate);
-  // Add interval days to get next service date
   const nextDate = new Date(lastDate);
   nextDate.setDate(lastDate.getDate() + intervalDays);
   
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   
-  // Calculate days remaining (actual calendar difference)
   const daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
   
-  let status = 'upcoming';
+  let status = 'serviced';
   let daysOverdue = 0;
   
   if (daysRemaining < 0) {
@@ -244,7 +241,7 @@ const calculateMonthStatus = (lastServiceDate, intervalDays) => {
   } else if (daysRemaining <= 4) {
     status = 'due_soon';
   } else {
-    status = 'upcoming';
+    status = 'serviced';
   }
   
   return {
@@ -256,17 +253,16 @@ const calculateMonthStatus = (lastServiceDate, intervalDays) => {
   };
 };
 
-// Calculate year-based maintenance
 const calculateYearStatus = (lastServiceYear, intervalYears) => {
   if (!lastServiceYear) {
-    return { years_remaining: intervalYears, status: 'upcoming', nextDueDate: null };
+    return { years_remaining: intervalYears, status: 'serviced', nextDueDate: null };
   }
   
   const currentYear = new Date().getFullYear();
   const nextYear = lastServiceYear + intervalYears;
   const yearsRemaining = nextYear - currentYear;
   
-  let status = 'upcoming';
+  let status = 'serviced';
   if (yearsRemaining < 0) {
     status = 'overdue';
   } else if (yearsRemaining === 0) {
@@ -280,13 +276,12 @@ const calculateYearStatus = (lastServiceYear, intervalYears) => {
   };
 };
 
-// Calculate hour-based maintenance (10 hours per day)
 const calculateHourStatus = (lastServiceDate, intervalHours) => {
   if (!lastServiceDate) {
     return { 
       current_hours: 0, 
       remaining_hours: intervalHours, 
-      status: 'upcoming', 
+      status: 'serviced', 
       nextDueDate: null, 
       daysOverdue: 0,
       nextServiceDate: null
@@ -301,12 +296,11 @@ const calculateHourStatus = (lastServiceDate, intervalHours) => {
   const current_hours = daysSinceService * 10;
   const remaining_hours = intervalHours - current_hours;
   
-  // Calculate next service date based on remaining hours (10 hours/day)
   const daysUntilDue = Math.ceil(remaining_hours / 10);
   const nextDate = new Date(today);
   nextDate.setDate(today.getDate() + daysUntilDue);
   
-  let status = 'upcoming';
+  let status = 'serviced';
   let daysOverdue = 0;
   
   if (remaining_hours <= 0) {
@@ -391,7 +385,7 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
               (equipment_name, equipment_type, maintenance_type, part_id, last_service_date,
                service_interval_hours, service_interval_months, service_interval_years,
                status, created_by, created_at, updated_at) 
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'upcoming', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
         args: [
           part_number, manufacturer || 'GSE Part', maintenance_type || 'hour', result.lastInsertRowid, today,
           service_interval_hours || 250, service_interval_months || 6, service_interval_years || 1,
@@ -589,13 +583,13 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE (FIXED DATE CALCULATION) ==========
+// ========== GET GSE MAINTENANCE ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY equipment_name`);
     
     const itemsWithStatus = result.rows.map(item => {
-      let status = 'upcoming';
+      let status = 'serviced';
       let current_hours = null;
       let remaining_hours = null;
       let days_remaining = null;
@@ -604,7 +598,6 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       let daysOverdue = 0;
       let current_service_display = null;
       let next_service_display = null;
-      let nextServiceDateObj = null;
       
       if (item.maintenance_type === 'hour' && item.service_interval_hours) {
         const calculation = calculateHourStatus(item.last_service_date, item.service_interval_hours);
@@ -613,7 +606,6 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         status = calculation.status;
         next_due_display = calculation.nextDueDate;
         daysOverdue = calculation.daysOverdue;
-        nextServiceDateObj = calculation.nextServiceDate;
         
         if (item.last_service_date) {
           current_service_display = `${item.last_service_date} (${current_hours} hrs used)`;
@@ -632,14 +624,12 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         }
         
       } else if (item.maintenance_type === 'month' && item.service_interval_months) {
-        // For month-based, interval is in months
         const intervalDays = item.service_interval_months * 30;
         const calculation = calculateMonthStatus(item.last_service_date, intervalDays);
         days_remaining = calculation.days_remaining;
         status = calculation.status;
         next_due_display = calculation.nextDueDate;
         daysOverdue = calculation.daysOverdue;
-        nextServiceDateObj = calculation.nextServiceDate;
         
         if (item.last_service_date) {
           current_service_display = item.last_service_date;
@@ -748,7 +738,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                            service_interval_hours = ?,
                            date_performed = CURRENT_TIMESTAMP, 
                            updated_at = CURRENT_TIMESTAMP,
-                           status = 'upcoming'
+                           status = 'serviced'
                        WHERE id = ?`;
         updateArgs = [
           service_performed || 'Routine service', 
@@ -768,7 +758,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                            service_interval_hours = ?,
                            date_performed = CURRENT_TIMESTAMP, 
                            updated_at = CURRENT_TIMESTAMP,
-                           status = 'upcoming'
+                           status = 'serviced'
                        WHERE id = ?`;
         updateArgs = [
           service_performed || 'Routine service', 
@@ -791,7 +781,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                          service_interval_months = ?,
                          date_performed = CURRENT_TIMESTAMP, 
                          updated_at = CURRENT_TIMESTAMP,
-                         status = 'upcoming'
+                         status = 'serviced'
                      WHERE id = ?`;
       updateArgs = [
         service_performed || 'Routine service', 
@@ -818,7 +808,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                          service_interval_years = ?,
                          date_performed = CURRENT_TIMESTAMP, 
                          updated_at = CURRENT_TIMESTAMP,
-                         status = 'upcoming'
+                         status = 'serviced'
                      WHERE id = ?`;
       updateArgs = [
         service_performed || 'Routine service', 
@@ -837,7 +827,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     res.json({ 
       success: true, 
-      message: `Service recorded successfully! Next service will be calculated from ${serviceDate}`,
+      message: `Service recorded successfully! Status updated to SERVICED. Next service will be calculated from ${serviceDate}`,
       service_date: serviceDate
     });
     
@@ -1043,8 +1033,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Date-based calculation: Next service = Last service date + Interval days');
-  console.log('⚠️ Due Soon: 4 days before next service date');
+  console.log('📅 Status: SERVICED (green) | DUE SOON (yellow) | OVERDUE (red)');
 };
 
 init();
@@ -1056,8 +1045,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 How it works:`);
-  console.log(`   📅 Month-based: Next service = Last service date + Interval days`);
-  console.log(`   ⏱️ Hour-based: Next service = Today + (Remaining hours ÷ 10) days`);
-  console.log(`   ⚠️ Due Soon: 4 days before next service date`);
+  console.log(`\n🔧 Status Definitions:`);
+  console.log(`   ✅ SERVICED: Recently serviced, next service >4 days or >40 hours away`);
+  console.log(`   🟡 DUE SOON: Service needed within 4 days or 40 hours`);
+  console.log(`   🔴 OVERDUE: Service date has passed or hours exceeded`);
 });
