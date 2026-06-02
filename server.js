@@ -161,7 +161,8 @@ const createSampleData = async () => {
     ['Tow Tractor #5', 'Tow Tractor', 'hour', 250, 'Oil change, Filter replaced', 'John Smith', today],
     ['GPU Unit #2', 'GPU', 'hour', 200, 'Battery check, Cable inspection', 'Jane Doe', today],
     ['Battery Charger #3', 'Battery Charger', 'month', 6, 'Calibration, Terminal cleaning', 'Bob Wilson', today],
-    ['Fire Extinguisher #1', 'Safety Equipment', 'year', 1, 'Annual inspection, Pressure check', 'Tom Harris', today]
+    ['Fire Extinguisher #1', 'Safety Equipment', 'year', 1, 'Annual inspection, Pressure check', 'Tom Harris', today],
+    ['Hand Tools Set #1', 'Hand Tools', 'none', null, 'No maintenance required', 'System', today]
   ];
   
   for (const eq of sampleEquipment) {
@@ -392,6 +393,18 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
           req.user.username
         ]
       });
+    } else {
+      // For no maintenance items, add to gse_maintenance without service date
+      await db.execute({ 
+        sql: `INSERT INTO gse_maintenance 
+              (equipment_name, equipment_type, maintenance_type, part_id,
+               status, created_by, created_at, updated_at) 
+              VALUES (?, ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        args: [
+          part_number, manufacturer || 'GSE Part', 'none', result.lastInsertRowid,
+          req.user.username
+        ]
+      });
     }
     
     res.json({ message: 'Part added successfully!' });
@@ -583,10 +596,18 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET GSE MAINTENANCE ==========
+// ========== GET GSE MAINTENANCE (INCLUDING NO MAINTENANCE ITEMS) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY equipment_name`);
+    const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY 
+      CASE maintenance_type
+        WHEN 'none' THEN 1
+        WHEN 'hour' THEN 2
+        WHEN 'month' THEN 3
+        WHEN 'year' THEN 4
+        ELSE 5
+      END,
+      equipment_name ASC`);
     
     const itemsWithStatus = result.rows.map(item => {
       let status = 'serviced';
@@ -599,7 +620,14 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       let current_service_display = null;
       let next_service_display = null;
       
-      if (item.maintenance_type === 'hour' && item.service_interval_hours) {
+      // Handle NO MAINTENANCE type
+      if (item.maintenance_type === 'none') {
+        status = 'no_maintenance';
+        current_service_display = 'No maintenance required';
+        next_service_display = 'Not applicable';
+        next_due_display = 'No schedule';
+        
+      } else if (item.maintenance_type === 'hour' && item.service_interval_hours) {
         const calculation = calculateHourStatus(item.last_service_date, item.service_interval_hours);
         current_hours = calculation.current_hours;
         remaining_hours = calculation.remaining_hours;
@@ -717,6 +745,12 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     }
     
     const maintenanceType = equipmentResult.rows[0].maintenance_type;
+    
+    // Don't allow service recording for no maintenance items
+    if (maintenanceType === 'none') {
+      return res.status(400).json({ error: 'This item requires no maintenance' });
+    }
+    
     let updateQuery = '';
     let updateArgs = [];
     
@@ -1033,7 +1067,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Status: SERVICED (green) | DUE SOON (yellow) | OVERDUE (red)');
+  console.log('📅 Status: SERVICED (green) | DUE SOON (yellow) | OVERDUE (red) | NO MAINTENANCE (gray)');
 };
 
 init();
@@ -1049,4 +1083,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   ✅ SERVICED: Recently serviced, next service >4 days or >40 hours away`);
   console.log(`   🟡 DUE SOON: Service needed within 4 days or 40 hours`);
   console.log(`   🔴 OVERDUE: Service date has passed or hours exceeded`);
+  console.log(`   ⚪ NO MAINTENANCE: No scheduled maintenance required`);
 });
