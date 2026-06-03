@@ -826,7 +826,7 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== DELETE FROM MAINTENANCE ==========
+// ========== DELETE FROM MAINTENANCE (Admin/Manager only) ==========
 app.delete('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager only' });
@@ -987,7 +987,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Edit feature: ALL users (including storekeeper) can edit maintenance items');
+  console.log('📅 Permissions: Edit/Add/Record for ALL users | Delete only for Admin/Manager');
 };
 
 init();
@@ -999,9 +999,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Edit Feature:`);
-  console.log(`   ✅ ALL users can click Edit button to fix mistakes`);
-  console.log(`   ✅ Can change maintenance type (Hour/Month/Year/None)`);
-  console.log(`   ✅ Can update interval and last service values`);
-  console.log(`   ✅ Delete button remains only for Admin/Manager`);
+  console.log(`\n🔧 Permissions:`);
+  console.log(`   ✅ Edit Equipment: ALL users`);
+  console.log(`   ✅ Record Service: ALL users`);
+  console.log(`   ✅ Add Equipment: ALL users`);
+  console.log(`   🗑️ Delete Equipment: Admin/Manager only`);
 });
