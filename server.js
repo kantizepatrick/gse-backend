@@ -718,7 +718,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
   }
 });
 
-// ========== EDIT MAINTENANCE ITEM (Admin/Manager only) ==========
+// ========== EDIT MAINTENANCE ITEM (ALL users including storekeeper) ==========
 app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -734,10 +734,7 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
     last_service_year
   } = req.body;
   
-  // Only admin or manager can edit
-  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
-    return res.status(403).json({ error: 'Access denied. Admin or Manager only' });
-  }
+  // ALLOW ALL AUTHENTICATED USERS (including storekeeper) - No role check
   
   try {
     const existing = await db.execute({ sql: 'SELECT * FROM gse_maintenance WHERE id = ?', args: [id] });
@@ -990,7 +987,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Edit feature: Admin/Manager can edit maintenance items');
+  console.log('📅 Edit feature: ALL users (including storekeeper) can edit maintenance items');
 };
 
 init();
@@ -1003,7 +1000,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
   console.log(`\n🔧 Edit Feature:`);
-  console.log(`   ✅ Admin/Manager can click Edit button to fix mistakes`);
+  console.log(`   ✅ ALL users can click Edit button to fix mistakes`);
   console.log(`   ✅ Can change maintenance type (Hour/Month/Year/None)`);
   console.log(`   ✅ Can update interval and last service values`);
+  console.log(`   ✅ Delete button remains only for Admin/Manager`);
 });
