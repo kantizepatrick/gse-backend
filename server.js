@@ -159,13 +159,12 @@ const createSampleData = async () => {
   
   const today = '2026-05-27';
   const currentYear = new Date().getFullYear();
-  const currentFullDate = new Date().toISOString().split('T')[0];
   
   const sampleEquipment = [
     ['Tow Tractor #5', 'Tow Tractor', 'hour', 250, 'Oil change, Filter replaced', 'John Smith', today, 0, null, null],
     ['GPU Unit #2', 'GPU', 'hour', 100, 'Battery check, Cable inspection', 'Jane Doe', today, 400, null, null],
     ['Battery Charger #3', 'Battery Charger', 'month', 6, 'Calibration, Terminal cleaning', 'Bob Wilson', today, null, null, null],
-    ['Fire Extinguisher #1', 'Safety Equipment', 'year', 1, 'Annual inspection', 'Tom Harris', null, null, currentYear - 1, `${currentYear - 1}-06-01`],
+    ['Fire Extinguisher #1', 'Safety Equipment', 'year', 1, 'Annual inspection', 'Tom Harris', null, null, currentYear - 1, `${currentYear - 1}-06-15`],
     ['Fire Extinguisher #2', 'Safety Equipment', 'year', 1, 'Annual inspection', 'Tom Harris', null, null, currentYear, `${currentYear}-01-15`],
     ['Hand Tools Set #1', 'Hand Tools', 'none', null, 'No maintenance required', 'System', today, null, null, null]
   ];
@@ -301,7 +300,7 @@ const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
   };
 };
 
-// ========== YEAR CALCULATION (Based on Full Date - Month/Day/Year) ==========
+// ========== YEAR CALCULATION (Full Date Support - YYYY-MM-DD) ==========
 const calculateYearStatus = (lastServiceFullDate, intervalYears) => {
   if (!lastServiceFullDate) {
     return { 
@@ -318,7 +317,7 @@ const calculateYearStatus = (lastServiceFullDate, intervalYears) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   
-  // Calculate next service full date by adding interval years
+  // Calculate next service full date by adding interval years (same month and day)
   const nextDate = new Date(lastDate);
   nextDate.setFullYear(nextDate.getFullYear() + intervalYears);
   
@@ -341,11 +340,15 @@ const calculateYearStatus = (lastServiceFullDate, intervalYears) => {
     status = 'upcoming';
   }
   
+  // Format the next due date for display
+  const nextDueDateFormatted = nextDate.toLocaleDateString();
+  const nextServiceFullDateISO = nextDate.toISOString().split('T')[0];
+  
   return {
     years_remaining: yearsRemaining > 0 ? yearsRemaining : 0,
     status,
-    nextDueDate: nextDate.toLocaleDateString(),
-    nextServiceFullDate: nextDate.toISOString().split('T')[0],
+    nextDueDate: nextDueDateFormatted,
+    nextServiceFullDate: nextServiceFullDateISO,
     monthsRemaining: monthsRemaining > 0 ? monthsRemaining : 0,
     daysRemaining: daysRemaining > 0 ? daysRemaining : 0
   };
@@ -518,6 +521,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         const calc = calculateMonthStatus(item.last_service_date, item.service_interval_months);
         return { ...item, status: calc.status, days_remaining: calc.days_remaining, next_due_display: calc.nextDueDate, daysOverdue: calc.daysOverdue, current_service_display: item.last_service_date || 'Not recorded', next_service_column: calc.days_remaining > 0 ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : `🔴 OVERDUE by ${calc.daysOverdue} days` };
       } else if (item.maintenance_type === 'year' && item.service_interval_years) {
+        // Use last_service_full_date if available, otherwise fall back to last_service_year
         const lastFullDate = item.last_service_full_date || (item.last_service_year ? `${item.last_service_year}-01-01` : null);
         const calc = calculateYearStatus(lastFullDate, item.service_interval_years);
         
@@ -525,7 +529,8 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         let current_service_display = '';
         
         if (lastFullDate) {
-          current_service_display = lastFullDate;
+          const dateObj = new Date(lastFullDate);
+          current_service_display = dateObj.toLocaleDateString();
         } else {
           current_service_display = item.last_service_year ? item.last_service_year.toString() : 'Not recorded';
         }
@@ -572,6 +577,8 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     current_hours 
   } = req.body;
   
+  console.log('📝 Recording service with data:', { id, service_date, current_hours, service_interval_hours });
+  
   try {
     const equipmentResult = await db.execute({ sql: 'SELECT maintenance_type FROM gse_maintenance WHERE id = ?', args: [id] });
     if (equipmentResult.rows.length === 0) {
@@ -583,11 +590,13 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       return res.status(400).json({ error: 'This item requires no maintenance' });
     }
     
+    // Use provided service date or today
     let serviceDateValue = new Date().toISOString().split('T')[0];
     if (service_date && service_date !== '') {
       serviceDateValue = service_date;
     }
     
+    // Use provided current hours or 0
     let currentHoursValue = 0;
     if (current_hours !== undefined && current_hours !== '') {
       currentHoursValue = parseInt(current_hours);
@@ -598,6 +607,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     if (maintenanceType === 'hour') {
       const newInterval = service_interval_hours ? parseInt(service_interval_hours) : 250;
+      
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
@@ -609,10 +619,21 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                          updated_at = CURRENT_TIMESTAMP,
                          status = 'serviced'
                      WHERE id = ?`;
-      updateArgs = [service_performed || 'Routine service', technician_name || '', notes || '', serviceDateValue, currentHoursValue, newInterval, id];
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        serviceDateValue,
+        currentHoursValue,
+        newInterval,
+        id
+      ];
+      
+      console.log('✅ Updating hour-based maintenance:', { serviceDateValue, currentHoursValue, newInterval });
       
     } else if (maintenanceType === 'month') {
       const newInterval = service_interval_months ? parseInt(service_interval_months) : 6;
+      
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
@@ -623,7 +644,14 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                          updated_at = CURRENT_TIMESTAMP,
                          status = 'serviced'
                      WHERE id = ?`;
-      updateArgs = [service_performed || 'Routine service', technician_name || '', notes || '', serviceDateValue, newInterval, id];
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        serviceDateValue,
+        newInterval,
+        id
+      ];
       
     } else if (maintenanceType === 'year') {
       const newInterval = service_interval_years ? parseInt(service_interval_years) : 1;
@@ -857,6 +885,7 @@ const init = async () => {
   console.log('✅ All data initialized');
   console.log('📅 Year-based: Full date (YYYY-MM-DD) support added');
   console.log('⚠️ Due Soon for Year-based: Within 30 days of next service date');
+  console.log('📊 Next service = Service Date + Interval Years (same month/day)');
 };
 
 init();
@@ -868,8 +897,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Year-based Calculation:`);
-  console.log(`   Stores full date (YYYY-MM-DD) for accurate calculation`);
-  console.log(`   Next service = Service Date + Interval Years`);
-  console.log(`   Due Soon when ≤ 30 days remaining`);
+  console.log(`\n🔧 Year-based Features:`);
+  console.log(`   ✅ Full Date Support (YYYY-MM-DD)`);
+  console.log(`   ✅ Next Service = Service Date + Interval Years`);
+  console.log(`   ✅ Due Soon when ≤ 30 days remaining`);
+  console.log(`   ✅ Shows days and months remaining`);
 });
