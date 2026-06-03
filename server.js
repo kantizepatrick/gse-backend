@@ -132,7 +132,7 @@ const createTables = async () => {
 // ========== CREATE SAMPLE DATA ==========
 const createSampleData = async () => {
   const sampleParts = [
-    ['P001', 'Brake Pad', 'Bendix', 'Tow Tractor', 'A-01', 50, 10, 'hour', 250, null, null, 'John Smith', '+1 234 567 8900', 'john@bendix.com'],
+    ['P001', 'Brake Pad', 'Bendix', 'Tow Tractor', 'A-01', 50, 10, 'hour', 100, null, null, 'John Smith', '+1 234 567 8900', 'john@bendix.com'],
     ['P002', 'Oil Filter', 'Fram', 'GPU', 'B-02', 30, 8, 'hour', 200, null, null, 'Jane Doe', '+1 234 567 8901', 'jane@fram.com'],
     ['P003', 'Air Filter', 'Donaldson', 'Tow Tractor', 'C-03', 25, 5, 'hour', 300, null, null, 'Bob Wilson', '+1 234 567 8902', 'bob@donaldson.com'],
     ['P004', 'Hydraulic Fluid', 'Shell', 'All GSE', 'D-01', 100, 20, 'month', null, 6, null, 'Shell Support', '+1 234 567 8903', 'support@shell.com'],
@@ -156,10 +156,10 @@ const createSampleData = async () => {
     }
   }
   
-  const today = new Date().toISOString().split('T')[0];
+  const today = '2026-05-27';
   const sampleEquipment = [
     ['Tow Tractor #5', 'Tow Tractor', 'hour', 250, 'Oil change, Filter replaced', 'John Smith', today, 0],
-    ['GPU Unit #2', 'GPU', 'hour', 100, 'Battery check, Cable inspection', 'Jane Doe', '2026-05-27', 400],
+    ['GPU Unit #2', 'GPU', 'hour', 100, 'Battery check, Cable inspection', 'Jane Doe', today, 400],
     ['Battery Charger #3', 'Battery Charger', 'month', 6, 'Calibration, Terminal cleaning', 'Bob Wilson', today, null],
     ['Fire Extinguisher #1', 'Safety Equipment', 'year', 1, 'Annual inspection, Pressure check', 'Tom Harris', today, null],
     ['Hand Tools Set #1', 'Hand Tools', 'none', null, 'No maintenance required', 'System', today, null]
@@ -211,51 +211,90 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ========== CALCULATION FUNCTIONS ==========
-
-// Calculate month-based status
-const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
+// ========== HOUR CALCULATION (CORRECTED) ==========
+const calculateHourStatus = (lastServiceDate, lastServiceHours, intervalHours) => {
   if (!lastServiceDate) {
     return { 
-      days_remaining: intervalMonths * 30, 
+      current_hours: lastServiceHours || 0,
+      remaining_hours: intervalHours,
       status: 'serviced', 
       nextDueDate: null, 
       daysOverdue: 0,
-      nextServiceDate: null
+      targetHours: (lastServiceHours || 0) + intervalHours
     };
+  }
+  
+  const lastDate = new Date(lastServiceDate);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  const daysSinceService = Math.floor((today - lastDate) / (1000 * 60 * 60 * 24));
+  const current_hours = (lastServiceHours || 0) + (daysSinceService * 10);
+  const targetHours = (lastServiceHours || 0) + intervalHours;
+  const remaining_hours = targetHours - current_hours;
+  
+  let nextDueDate = null;
+  if (remaining_hours > 0) {
+    const daysUntilDue = Math.ceil(remaining_hours / 10);
+    const nextDate = new Date(today);
+    nextDate.setDate(today.getDate() + daysUntilDue);
+    nextDueDate = nextDate.toLocaleDateString();
+  } else {
+    const daysOverdueCount = Math.abs(Math.floor(remaining_hours / 10));
+    const overdueDate = new Date(today);
+    overdueDate.setDate(today.getDate() - daysOverdueCount);
+    nextDueDate = overdueDate.toLocaleDateString();
+  }
+  
+  let status = 'serviced';
+  let daysOverdue = 0;
+  
+  if (remaining_hours <= 0) {
+    status = 'overdue';
+    daysOverdue = Math.abs(Math.floor(remaining_hours / 10));
+  } else if (remaining_hours <= 40) {
+    status = 'due_soon';
+  }
+  
+  return {
+    current_hours: Math.round(current_hours),
+    remaining_hours: remaining_hours > 0 ? Math.round(remaining_hours) : 0,
+    status,
+    nextDueDate: nextDueDate,
+    daysOverdue,
+    targetHours: targetHours
+  };
+};
+
+const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
+  if (!lastServiceDate) {
+    return { days_remaining: intervalMonths * 30, status: 'serviced', nextDueDate: null, daysOverdue: 0 };
   }
   
   const lastDate = new Date(lastServiceDate);
   const nextDate = new Date(lastDate);
   nextDate.setMonth(nextDate.getMonth() + intervalMonths);
-  
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  
   const daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
   
   let status = 'serviced';
   let daysOverdue = 0;
-  
   if (daysRemaining < 0) {
     status = 'overdue';
     daysOverdue = Math.abs(daysRemaining);
   } else if (daysRemaining <= 4) {
     status = 'due_soon';
-  } else {
-    status = 'serviced';
   }
   
   return {
     days_remaining: daysRemaining > 0 ? daysRemaining : 0,
     status,
     nextDueDate: nextDate.toLocaleDateString(),
-    daysOverdue,
-    nextServiceDate: nextDate
+    daysOverdue
   };
 };
 
-// Calculate year-based status
 const calculateYearStatus = (lastServiceYear, intervalYears) => {
   if (!lastServiceYear) {
     return { years_remaining: intervalYears, status: 'serviced', nextDueDate: null };
@@ -279,91 +318,16 @@ const calculateYearStatus = (lastServiceYear, intervalYears) => {
   };
 };
 
-// FIXED: Calculate hour-based status - Interval is ADDITIONAL hours from last service hours
-const calculateHourStatus = (lastServiceDate, lastServiceHours, intervalHours) => {
-  if (!lastServiceDate) {
-    return { 
-      current_hours: lastServiceHours || 0,
-      remaining_hours: intervalHours,
-      status: 'serviced', 
-      nextDueDate: null, 
-      daysOverdue: 0,
-      nextServiceDate: null,
-      nextServiceDateFormatted: null,
-      targetHours: (lastServiceHours || 0) + intervalHours
-    };
-  }
-  
-  const lastDate = new Date(lastServiceDate);
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  
-  // Calculate days since last service
-  const daysSinceService = Math.floor((today - lastDate) / (1000 * 60 * 60 * 24));
-  
-  // Current hours = last recorded service hours + (days since service × 10)
-  const current_hours = (lastServiceHours || 0) + (daysSinceService * 10);
-  
-  // Target hours for next service = last service hours + interval
-  const targetHours = (lastServiceHours || 0) + intervalHours;
-  
-  // Remaining hours = target hours - current hours
-  const remaining_hours = targetHours - current_hours;
-  
-  // Calculate next service date based on remaining hours (10 hours/day)
-  let nextServiceDateFormatted = null;
-  
-  if (remaining_hours > 0) {
-    const daysUntilDue = Math.ceil(remaining_hours / 10);
-    const nextDate = new Date(today);
-    nextDate.setDate(today.getDate() + daysUntilDue);
-    nextServiceDateFormatted = nextDate.toLocaleDateString();
-  } else {
-    const daysOverdueCount = Math.abs(Math.floor(remaining_hours / 10));
-    const overdueDate = new Date(today);
-    overdueDate.setDate(today.getDate() - daysOverdueCount);
-    nextServiceDateFormatted = overdueDate.toLocaleDateString();
-  }
-  
-  let status = 'serviced';
-  let daysOverdue = 0;
-  
-  if (remaining_hours <= 0) {
-    status = 'overdue';
-    daysOverdue = Math.abs(Math.floor(remaining_hours / 10));
-  } else if (remaining_hours <= 40) {
-    status = 'due_soon';
-  }
-  
-  return {
-    current_hours: Math.round(current_hours),
-    remaining_hours: remaining_hours > 0 ? Math.round(remaining_hours) : 0,
-    status,
-    nextDueDate: nextServiceDateFormatted,
-    daysOverdue,
-    daysSinceService,
-    targetHours: targetHours,
-    nextServiceDateFormatted: nextServiceDateFormatted
-  };
-};
-
 // ========== LOGIN ==========
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  
   try {
     const result = await db.execute({ sql: 'SELECT * FROM users WHERE username = ?', args: [username] });
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
     const user = result.rows[0];
     if (bcrypt.compareSync(password, user.password_hash)) {
       const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY);
-      res.json({ 
-        token, 
-        user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } 
-      });
+      res.json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role, email: user.email } });
     } else {
       res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -384,53 +348,15 @@ app.get('/api/parts', authenticateToken, async (req, res) => {
 
 // ========== CREATE PART ==========
 app.post('/api/parts', authenticateToken, async (req, res) => {
-  const { 
-    part_number, description, manufacturer, compatible_gse, location_bin, min_stock,
-    maintenance_type, service_interval_hours, service_interval_months, service_interval_years,
-    contact_person, contact_phone, contact_email 
-  } = req.body;
-  
+  const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, contact_person, contact_phone, contact_email } = req.body;
   try {
-    const result = await db.execute({ 
-      sql: `INSERT INTO parts 
-            (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand,
-             maintenance_type, service_interval_hours, service_interval_months, service_interval_years,
-             contact_person, contact_phone, contact_email) 
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [
-        part_number, description || '', manufacturer || '', compatible_gse || '', location_bin || '', min_stock || 5,
-        maintenance_type || 'hour', service_interval_hours || 250, service_interval_months || 6, service_interval_years || 1,
-        contact_person || '', contact_phone || '', contact_email || ''
-      ]
-    });
-    
+    const result = await db.execute({ sql: `INSERT INTO parts (part_number, description, manufacturer, compatible_gse, location_bin, min_stock, quantity_on_hand, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, contact_person, contact_phone, contact_email) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`, args: [part_number, description || '', manufacturer || '', compatible_gse || '', location_bin || '', min_stock || 5, maintenance_type || 'hour', service_interval_hours || 250, service_interval_months || 6, service_interval_years || 1, contact_person || '', contact_phone || '', contact_email || ''] });
     if (maintenance_type !== 'none') {
       const today = new Date().toISOString().split('T')[0];
-      await db.execute({ 
-        sql: `INSERT INTO gse_maintenance 
-              (equipment_name, equipment_type, maintenance_type, part_id, last_service_date, last_service_hours,
-               service_interval_hours, service_interval_months, service_interval_years,
-               status, created_by, created_at, updated_at) 
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-        args: [
-          part_number, manufacturer || 'GSE Part', maintenance_type || 'hour', result.lastInsertRowid, today, 0,
-          service_interval_hours || 250, service_interval_months || 6, service_interval_years || 1,
-          req.user.username
-        ]
-      });
+      await db.execute({ sql: `INSERT INTO gse_maintenance (equipment_name, equipment_type, maintenance_type, part_id, last_service_date, last_service_hours, service_interval_hours, service_interval_months, service_interval_years, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, args: [part_number, manufacturer || 'GSE Part', maintenance_type || 'hour', result.lastInsertRowid, today, service_interval_hours || 250, service_interval_months || 6, service_interval_years || 1, req.user.username] });
     } else {
-      await db.execute({ 
-        sql: `INSERT INTO gse_maintenance 
-              (equipment_name, equipment_type, maintenance_type, part_id,
-               status, created_by, created_at, updated_at) 
-              VALUES (?, ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-        args: [
-          part_number, manufacturer || 'GSE Part', 'none', result.lastInsertRowid,
-          req.user.username
-        ]
-      });
+      await db.execute({ sql: `INSERT INTO gse_maintenance (equipment_name, equipment_type, maintenance_type, part_id, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, args: [part_number, manufacturer || 'GSE Part', 'none', result.lastInsertRowid, req.user.username] });
     }
-    
     res.json({ message: 'Part added successfully!' });
   } catch (err) {
     console.error('Create part error:', err.message);
@@ -441,29 +367,15 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
 // ========== RECEIVE PARTS ==========
 app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
-  
   const receiveQty = parseInt(quantity);
-  if (isNaN(receiveQty) || receiveQty <= 0) {
-    return res.status(400).json({ error: 'Invalid quantity' });
-  }
-  
+  if (isNaN(receiveQty) || receiveQty <= 0) return res.status(400).json({ error: 'Invalid quantity' });
   try {
     const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Part not found' });
-    }
-    
+    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
     const part = partResult.rows[0];
     const newQuantity = part.quantity_on_hand + receiveQty;
-    
-    await db.execute({ 
-      sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) 
-            VALUES (?, 'RECEIVE', ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
-      args: [part.id, receiveQty, reference_number || '', notes || '', req.user.username] 
-    });
-    
+    await db.execute({ sql: `INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by, created_at) VALUES (?, 'RECEIVE', ?, ?, ?, ?, CURRENT_TIMESTAMP)`, args: [part.id, receiveQty, reference_number || '', notes || '', req.user.username] });
     await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', args: [newQuantity, part.id] });
-    
     res.json({ success: true, message: 'Parts received successfully', new_stock: newQuantity });
   } catch (err) {
     console.error('Receive error:', err.message);
@@ -474,30 +386,14 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
 // ========== SUBMIT ISSUE REQUEST ==========
 app.post('/api/requests/issue', authenticateToken, async (req, res) => {
   const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
-  
   const requestQty = parseInt(quantity);
-  if (isNaN(requestQty) || requestQty <= 0) {
-    return res.status(400).json({ error: 'Invalid quantity' });
-  }
-  
+  if (isNaN(requestQty) || requestQty <= 0) return res.status(400).json({ error: 'Invalid quantity' });
   try {
     const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
-    if (partResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Part not found' });
-    }
-    
+    if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
     const part = partResult.rows[0];
-    if (part.quantity_on_hand < requestQty) {
-      return res.status(400).json({ error: 'Insufficient stock available' });
-    }
-    
-    await db.execute({ 
-      sql: `INSERT INTO pending_issues 
-            (part_number, part_id, quantity, gse_registration, technician_name, work_order, notes, requested_by, requested_by_name, status, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)`, 
-      args: [part_number, part.id, requestQty, gse_registration || '', technician_name || '', work_order || '', notes || '', req.user.id, req.user.username] 
-    });
-    
+    if (part.quantity_on_hand < requestQty) return res.status(400).json({ error: 'Insufficient stock available' });
+    await db.execute({ sql: `INSERT INTO pending_issues (part_number, part_id, quantity, gse_registration, technician_name, work_order, notes, requested_by, requested_by_name, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)`, args: [part_number, part.id, requestQty, gse_registration || '', technician_name || '', work_order || '', notes || '', req.user.id, req.user.username] });
     res.json({ success: true, message: 'Issue request submitted for approval' });
   } catch (err) {
     console.error('Submit error:', err.message);
@@ -507,18 +403,9 @@ app.post('/api/requests/issue', authenticateToken, async (req, res) => {
 
 // ========== GET PENDING REQUESTS ==========
 app.get('/api/requests/pending', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') return res.status(403).json({ error: 'Access denied' });
   try {
-    const result = await db.execute(`
-      SELECT p.*, parts.quantity_on_hand as current_stock, parts.description
-      FROM pending_issues p
-      JOIN parts ON p.part_id = parts.id
-      WHERE p.status = 'pending'
-      ORDER BY p.created_at DESC
-    `);
+    const result = await db.execute(`SELECT p.*, parts.quantity_on_hand as current_stock, parts.description FROM pending_issues p JOIN parts ON p.part_id = parts.id WHERE p.status = 'pending' ORDER BY p.created_at DESC`);
     res.json({ success: true, requests: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -529,53 +416,19 @@ app.get('/api/requests/pending', authenticateToken, async (req, res) => {
 app.post('/api/requests/:id/approve', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { comment } = req.body;
-  
-  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') return res.status(403).json({ error: 'Access denied' });
   try {
-    const requestResult = await db.execute({ 
-      sql: "SELECT * FROM pending_issues WHERE id = ? AND status = 'pending'", 
-      args: [id] 
-    });
-    
-    if (requestResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Request not found' });
-    }
-    
+    const requestResult = await db.execute({ sql: "SELECT * FROM pending_issues WHERE id = ? AND status = 'pending'", args: [id] });
+    if (requestResult.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
     const request = requestResult.rows[0];
     const requestQty = parseInt(request.quantity);
-    
-    const partResult = await db.execute({ 
-      sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', 
-      args: [request.part_id] 
-    });
-    
+    const partResult = await db.execute({ sql: 'SELECT quantity_on_hand FROM parts WHERE id = ?', args: [request.part_id] });
     const currentStock = partResult.rows[0].quantity_on_hand;
     const newStock = currentStock - requestQty;
-    
-    if (currentStock < requestQty) {
-      return res.status(400).json({ error: `Insufficient stock! Only ${currentStock} units available.` });
-    }
-    
-    await db.execute({ 
-      sql: `INSERT INTO transactions 
-            (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by, created_at) 
-            VALUES (?, 'ISSUE', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, 
-      args: [request.part_id, requestQty, request.gse_registration || '', request.technician_name || '', request.work_order || '', request.notes || '', req.user.username] 
-    });
-    
-    await db.execute({ 
-      sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', 
-      args: [newStock, request.part_id] 
-    });
-    
-    await db.execute({ 
-      sql: "UPDATE pending_issues SET status = 'approved', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?", 
-      args: [comment || null, req.user.username, id] 
-    });
-    
+    if (currentStock < requestQty) return res.status(400).json({ error: `Insufficient stock! Only ${currentStock} units available.` });
+    await db.execute({ sql: `INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by, created_at) VALUES (?, 'ISSUE', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`, args: [request.part_id, requestQty, request.gse_registration || '', request.technician_name || '', request.work_order || '', request.notes || '', req.user.username] });
+    await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = ? WHERE id = ?', args: [newStock, request.part_id] });
+    await db.execute({ sql: "UPDATE pending_issues SET status = 'approved', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?", args: [comment || null, req.user.username, id] });
     res.json({ success: true, message: 'Request approved and stock deducted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -586,16 +439,9 @@ app.post('/api/requests/:id/approve', authenticateToken, async (req, res) => {
 app.post('/api/requests/:id/reject', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { comment } = req.body;
-  
-  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') return res.status(403).json({ error: 'Access denied' });
   try {
-    await db.execute({ 
-      sql: "UPDATE pending_issues SET status = 'rejected', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?", 
-      args: [comment || null, req.user.username, id] 
-    });
+    await db.execute({ sql: "UPDATE pending_issues SET status = 'rejected', admin_comment = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP WHERE id = ?", args: [comment || null, req.user.username, id] });
     res.json({ success: true, message: 'Request rejected' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -605,138 +451,41 @@ app.post('/api/requests/:id/reject', authenticateToken, async (req, res) => {
 // ========== GET MY REQUESTS ==========
 app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute({ 
-      sql: `SELECT p.*, parts.description 
-            FROM pending_issues p
-            JOIN parts ON p.part_id = parts.id
-            WHERE p.requested_by = ?
-            ORDER BY p.created_at DESC
-            LIMIT 50`, 
-      args: [req.user.id] 
-    });
+    const result = await db.execute({ sql: `SELECT p.*, parts.description FROM pending_issues p JOIN parts ON p.part_id = parts.id WHERE p.requested_by = ? ORDER BY p.created_at DESC LIMIT 50`, args: [req.user.id] });
     res.json({ success: true, requests: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== GET GSE MAINTENANCE (FIXED CALCULATION) ==========
+// ========== GET GSE MAINTENANCE ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY 
-      CASE maintenance_type
-        WHEN 'none' THEN 1
-        WHEN 'hour' THEN 2
-        WHEN 'month' THEN 3
-        WHEN 'year' THEN 4
-        ELSE 5
-      END,
-      equipment_name ASC`);
-    
+    const result = await db.execute(`SELECT * FROM gse_maintenance ORDER BY equipment_name`);
     const itemsWithStatus = result.rows.map(item => {
-      let status = 'serviced';
-      let current_hours = null;
-      let remaining_hours = null;
-      let days_remaining = null;
-      let years_remaining = null;
-      let next_due_display = null;
-      let daysOverdue = 0;
-      let current_service_display = null;
-      let next_service_column = null;
-      let next_due_date_formatted = null;
-      let target_hours = null;
-      
       if (item.maintenance_type === 'none') {
-        status = 'no_maintenance';
-        current_service_display = 'No maintenance required';
-        next_service_column = '⚪ No maintenance required';
-        
+        return { ...item, status: 'no_maintenance', current_service_display: 'No maintenance required', next_service_column: '⚪ No maintenance required' };
       } else if (item.maintenance_type === 'hour' && item.service_interval_hours) {
-        // FIXED: Interval is ADDITIONAL hours from last service hours
-        const calculation = calculateHourStatus(item.last_service_date, item.last_service_hours, item.service_interval_hours);
-        current_hours = calculation.current_hours;
-        remaining_hours = calculation.remaining_hours;
-        status = calculation.status;
-        next_due_date_formatted = calculation.nextServiceDateFormatted;
-        daysOverdue = calculation.daysOverdue;
-        target_hours = calculation.targetHours;
-        
-        // Display format: Date (Last recorded: X hrs, Current: Y hrs, Target: Z hrs)
-        if (item.last_service_date) {
-          current_service_display = `${item.last_service_date} (Last recorded: ${item.last_service_hours || 0} hrs, Current: ${current_hours} hrs, Target: ${target_hours} hrs)`;
-        } else {
-          current_service_display = 'Not recorded';
-        }
-        
-        if (remaining_hours > 0) {
-          const daysLeft = Math.ceil(remaining_hours / 10);
-          next_service_column = `📅 ${next_due_date_formatted} (${remaining_hours} hours / ${daysLeft} days remaining until ${target_hours} hrs)`;
-        } else if (remaining_hours <= 0) {
-          next_service_column = `🔴 OVERDUE by ${Math.abs(remaining_hours)} hours (Should have reached ${target_hours} hrs on ${next_due_date_formatted})`;
-        } else {
-          next_service_column = 'Schedule service';
-        }
-        
+        const calc = calculateHourStatus(item.last_service_date, item.last_service_hours, item.service_interval_hours);
+        return { 
+          ...item, 
+          status: calc.status, 
+          current_hours: calc.current_hours, 
+          remaining_hours: calc.remaining_hours, 
+          next_due_display: calc.nextDueDate, 
+          daysOverdue: calc.daysOverdue,
+          current_service_display: item.last_service_date ? `${item.last_service_date} (Last: ${item.last_service_hours || 0} hrs, Current: ${calc.current_hours} hrs, Target: ${calc.targetHours} hrs)` : 'Not recorded',
+          next_service_column: calc.remaining_hours > 0 ? `📅 ${calc.nextDueDate} (${calc.remaining_hours} hours until ${calc.targetHours} hrs)` : `🔴 OVERDUE by ${Math.abs(calc.remaining_hours)} hours (Target: ${calc.targetHours} hrs on ${calc.nextDueDate})`
+        };
       } else if (item.maintenance_type === 'month' && item.service_interval_months) {
-        const calculation = calculateMonthStatus(item.last_service_date, item.service_interval_months);
-        days_remaining = calculation.days_remaining;
-        status = calculation.status;
-        next_due_date_formatted = calculation.nextDueDate;
-        daysOverdue = calculation.daysOverdue;
-        
-        if (item.last_service_date) {
-          current_service_display = item.last_service_date;
-        } else {
-          current_service_display = 'Not recorded';
-        }
-        
-        if (days_remaining > 0) {
-          const weeksLeft = (days_remaining / 7).toFixed(1);
-          next_service_column = `📅 ${next_due_date_formatted} (${days_remaining} days / ${weeksLeft} weeks remaining)`;
-        } else if (days_remaining === 0) {
-          next_service_column = `⚠️ DUE TODAY: Service required today (${next_due_date_formatted})`;
-        } else if (days_remaining < 0) {
-          next_service_column = `🔴 OVERDUE by ${Math.abs(days_remaining)} days (Was due: ${next_due_date_formatted})`;
-        } else {
-          next_service_column = 'Schedule service';
-        }
-        
+        const calc = calculateMonthStatus(item.last_service_date, item.service_interval_months);
+        return { ...item, status: calc.status, days_remaining: calc.days_remaining, next_due_display: calc.nextDueDate, daysOverdue: calc.daysOverdue, current_service_display: item.last_service_date || 'Not recorded', next_service_column: calc.days_remaining > 0 ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : `🔴 OVERDUE by ${calc.daysOverdue} days` };
       } else if (item.maintenance_type === 'year' && item.service_interval_years) {
-        const lastYear = item.last_service_year || new Date().getFullYear();
-        const calculation = calculateYearStatus(lastYear, item.service_interval_years);
-        years_remaining = calculation.years_remaining;
-        status = calculation.status;
-        next_due_date_formatted = calculation.nextDueDate;
-        
-        if (item.last_service_year) {
-          current_service_display = item.last_service_year.toString();
-        } else {
-          current_service_display = 'Not recorded';
-        }
-        
-        if (years_remaining > 0) {
-          next_service_column = `📅 Year ${next_due_date_formatted} (${years_remaining} years remaining)`;
-        } else if (years_remaining === 0) {
-          next_service_column = `⚠️ DUE SOON: Service due this year (${next_due_date_formatted})`;
-        } else {
-          next_service_column = `🔴 OVERDUE: Service was due in ${next_due_date_formatted}`;
-        }
+        const calc = calculateYearStatus(item.last_service_year, item.service_interval_years);
+        return { ...item, status: calc.status, years_remaining: calc.years_remaining, next_due_display: calc.nextDueDate, current_service_display: item.last_service_year ? item.last_service_year.toString() : 'Not recorded', next_service_column: calc.years_remaining > 0 ? `📅 Year ${calc.nextDueDate} (${calc.years_remaining} years remaining)` : calc.status === 'due_soon' ? `⚠️ DUE SOON: Service due this year (${calc.nextDueDate})` : `🔴 OVERDUE: Service was due in ${calc.nextDueDate}` };
       }
-      
-      return {
-        ...item,
-        status,
-        current_hours,
-        remaining_hours,
-        days_remaining,
-        years_remaining,
-        next_due_display: next_due_date_formatted,
-        daysOverdue,
-        current_service_display,
-        next_service_column
-      };
+      return item;
     });
-    
     res.json({ success: true, equipment: itemsWithStatus });
   } catch (err) {
     console.error('Error fetching maintenance:', err.message);
@@ -744,32 +493,29 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECORD SERVICE (FIXED - Saves both date AND hours correctly) ==========
+// ========== RECORD SERVICE (FIXED - PROPERLY SAVES DATA) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
     service_performed, 
     technician_name, 
     notes, 
-    service_interval_hours,
-    service_interval_months,
-    service_interval_years,
-    service_date,
-    current_hours
+    service_interval_hours, 
+    service_interval_months, 
+    service_interval_years, 
+    service_date, 
+    current_hours 
   } = req.body;
   
+  console.log('📝 Recording service with data:', { id, service_date, current_hours, service_interval_hours });
+  
   try {
-    const equipmentResult = await db.execute({ 
-      sql: 'SELECT maintenance_type FROM gse_maintenance WHERE id = ?', 
-      args: [id] 
-    });
-    
+    const equipmentResult = await db.execute({ sql: 'SELECT maintenance_type FROM gse_maintenance WHERE id = ?', args: [id] });
     if (equipmentResult.rows.length === 0) {
       return res.status(404).json({ error: 'Equipment not found' });
     }
     
     const maintenanceType = equipmentResult.rows[0].maintenance_type;
-    
     if (maintenanceType === 'none') {
       return res.status(400).json({ error: 'This item requires no maintenance' });
     }
@@ -813,6 +559,8 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         newInterval,
         id
       ];
+      
+      console.log('✅ Updating hour-based maintenance:', { serviceDateValue, currentHoursValue, newInterval, targetHours });
       
     } else if (maintenanceType === 'month') {
       const newInterval = service_interval_months ? parseInt(service_interval_months) : 6;
@@ -869,31 +617,37 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     await db.execute({ sql: updateQuery, args: updateArgs });
     
-    // Calculate and return next service info
+    // Calculate next service info for response
     let nextServiceInfo = '';
+    let nextDateFormatted = '';
+    
     if (maintenanceType === 'hour') {
       const interval = service_interval_hours || 250;
       const target = currentHoursValue + interval;
       const daysToAdd = Math.ceil(interval / 10);
       const nextDate = new Date(serviceDateValue);
       nextDate.setDate(nextDate.getDate() + daysToAdd);
-      nextServiceInfo = `Next service when meter reaches ${target} hours (≈ ${nextDate.toLocaleDateString()}) - Add ${interval} hours from current reading`;
+      nextDateFormatted = nextDate.toLocaleDateString();
+      nextServiceInfo = `Next service when meter reaches ${target} hours (≈ ${nextDateFormatted})`;
     } else if (maintenanceType === 'month') {
       const interval = service_interval_months || 6;
       const nextDate = new Date(serviceDateValue);
       nextDate.setMonth(nextDate.getMonth() + interval);
-      nextServiceInfo = `Next service due on ${nextDate.toLocaleDateString()} (${interval} months from service date)`;
+      nextDateFormatted = nextDate.toLocaleDateString();
+      nextServiceInfo = `Next service due on ${nextDateFormatted}`;
     } else if (maintenanceType === 'year') {
       const interval = service_interval_years || 1;
       const nextYear = new Date(serviceDateValue).getFullYear() + interval;
-      nextServiceInfo = `Next service due in year ${nextYear} (${interval} year(s) from service year)`;
+      nextDateFormatted = nextYear.toString();
+      nextServiceInfo = `Next service due in year ${nextYear}`;
     }
     
     res.json({ 
       success: true, 
-      message: `✅ Service recorded! Date: ${serviceDateValue} | Current Hours: ${currentHoursValue} hrs\n${nextServiceInfo}`,
+      message: `✅ Service recorded!\n📅 Service Date: ${serviceDateValue}\n⏱️ Current Hours: ${currentHoursValue} hrs\n📊 ${nextServiceInfo}`,
       service_date: serviceDateValue,
-      current_hours: currentHoursValue
+      current_hours: currentHoursValue,
+      next_due: nextDateFormatted
     });
     
   } catch (err) {
@@ -907,7 +661,6 @@ app.delete('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager only' });
   }
-  
   try {
     await db.execute({ sql: 'DELETE FROM gse_maintenance WHERE id = ?', args: [req.params.id] });
     res.json({ success: true, message: 'Item removed from maintenance schedule' });
@@ -986,22 +739,12 @@ app.delete('/api/users/:id', authenticateToken, async (req, res) => {
 // ========== CHANGE PASSWORD ==========
 app.post('/api/change-password', authenticateToken, async (req, res) => {
   const { current_password, new_password } = req.body;
-  
-  if (!current_password || !new_password) {
-    return res.status(400).json({ error: 'Current and new password required' });
-  }
-  if (new_password.length < 4) {
-    return res.status(400).json({ error: 'Password must be at least 4 characters' });
-  }
-  
+  if (!current_password || !new_password) return res.status(400).json({ error: 'Current and new password required' });
+  if (new_password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
   try {
     const result = await db.execute({ sql: 'SELECT password_hash FROM users WHERE id = ?', args: [req.user.id] });
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    
-    if (!bcrypt.compareSync(current_password, result.rows[0].password_hash)) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
-    }
-    
+    if (!bcrypt.compareSync(current_password, result.rows[0].password_hash)) return res.status(401).json({ error: 'Current password is incorrect' });
     const new_hash = bcrypt.hashSync(new_password, 10);
     await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [new_hash, req.user.id] });
     res.json({ message: 'Password changed successfully! Please login again.' });
@@ -1013,25 +756,14 @@ app.post('/api/change-password', authenticateToken, async (req, res) => {
 // ========== ADMIN RESET PASSWORD ==========
 app.post('/api/admin/reset-password', authenticateToken, async (req, res) => {
   const { user_id, new_password } = req.body;
-  
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Access denied. Admin only.' });
-  }
-  
-  if (!user_id || !new_password || new_password.length < 4) {
-    return res.status(400).json({ error: 'User ID and valid password required' });
-  }
-  
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied. Admin only.' });
+  if (!user_id || !new_password || new_password.length < 4) return res.status(400).json({ error: 'User ID and valid password required' });
   try {
     const userResult = await db.execute({ sql: 'SELECT id, username FROM users WHERE id = ?', args: [user_id] });
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     const targetUser = userResult.rows[0];
     const newHashedPassword = bcrypt.hashSync(new_password, 10);
     await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [newHashedPassword, user_id] });
-    
     res.json({ success: true, message: `Password reset successfully for ${targetUser.username}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1043,20 +775,14 @@ const resetCodes = new Map();
 
 app.post('/api/forgot-password', async (req, res) => {
   const { username } = req.body;
-  
   try {
     const result = await db.execute({ sql: 'SELECT id, username, email FROM users WHERE username = ?', args: [username] });
-    if (result.rows.length === 0) {
-      return res.json({ success: true, message: 'If an account exists, a reset code has been sent.' });
-    }
-    
+    if (result.rows.length === 0) return res.json({ success: true, message: 'If an account exists, a reset code has been sent.' });
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
     resetCodes.set(username, { code: resetCode, expires: Date.now() + 3600000 });
-    
     console.log('========================================');
     console.log(`🔐 PASSWORD RESET CODE FOR ${username}: ${resetCode}`);
     console.log('========================================');
-    
     res.json({ success: true, message: 'Reset code sent! Check server console.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1065,20 +791,12 @@ app.post('/api/forgot-password', async (req, res) => {
 
 app.post('/api/reset-password', async (req, res) => {
   const { username, reset_code, new_password } = req.body;
-  
   const stored = resetCodes.get(username);
-  if (!stored || stored.code !== reset_code) {
-    return res.status(400).json({ error: 'Invalid reset code' });
-  }
-  if (Date.now() > stored.expires) {
-    resetCodes.delete(username);
-    return res.status(400).json({ error: 'Reset code expired' });
-  }
-  
+  if (!stored || stored.code !== reset_code) return res.status(400).json({ error: 'Invalid reset code' });
+  if (Date.now() > stored.expires) return res.status(400).json({ error: 'Reset code expired' });
   const newHashedPassword = bcrypt.hashSync(new_password, 10);
   await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE username = ?', args: [newHashedPassword, username] });
   resetCodes.delete(username);
-  
   res.json({ success: true, message: 'Password reset successfully!' });
 });
 
@@ -1098,9 +816,9 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 FIXED: Interval = ADDITIONAL hours from last service reading');
-  console.log('⏱️ Example: Last reading 400 hrs + 100 hrs interval = Target 500 hrs');
-  console.log('📊 Current hours = Last reading + (Days since service × 10)');
+  console.log('📅 Service Recording: Now properly saves date and hours');
+  console.log('⏱️ Target Hours = Last Recorded Hours + Interval Hours');
+  console.log('📊 Current Hours = Last Recorded Hours + (Days Since × 10)');
 };
 
 init();
@@ -1112,9 +830,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 CORRECTED Calculation Formula:`);
-  console.log(`   Target Hours = Last Recorded Hours + Interval Hours`);
-  console.log(`   Current Hours = Last Recorded Hours + (Days Since Service × 10)`);
-  console.log(`   Remaining Hours = Target Hours - Current Hours`);
-  console.log(`   Status: SERVICED → DUE SOON (≤40hrs) → OVERDUE (≤0hrs)`);
+  console.log(`\n🔧 Fixed Calculation:`);
+  console.log(`   Service Date + Current Hours are saved correctly`);
+  console.log(`   Target = Last Hours + Interval`);
+  console.log(`   Remaining = Target - Current Hours`);
 });
