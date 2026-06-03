@@ -565,6 +565,111 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   }
 });
 
+// ========== ADD GSE MAINTENANCE EQUIPMENT (FIXED) ==========
+app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
+  const {
+    equipment_name,
+    equipment_type,
+    maintenance_type,
+    service_interval_hours,
+    service_interval_months,
+    service_interval_years,
+    last_service_date,
+    last_service_hours,
+    last_service_year,
+    service_performed,
+    technician_name,
+    notes
+  } = req.body;
+  
+  try {
+    if (!equipment_name) {
+      return res.status(400).json({ error: 'Equipment name is required' });
+    }
+    
+    let query = '';
+    let args = [];
+    
+    if (maintenance_type === 'hour') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type, 
+                service_interval_hours, last_service_date, last_service_hours,
+                service_performed, technician_name, notes, status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_interval_hours || 250,
+        last_service_date || null,
+        last_service_hours || 0,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else if (maintenance_type === 'month') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type, 
+                service_interval_months, last_service_date,
+                service_performed, technician_name, notes, status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_interval_months || 6,
+        last_service_date || null,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else if (maintenance_type === 'year') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type, 
+                service_interval_years, last_service_year, last_service_full_date,
+                service_performed, technician_name, notes, status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_interval_years || 1,
+        last_service_year || new Date().getFullYear(),
+        last_service_date || null,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else if (maintenance_type === 'none') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type,
+                service_performed, technician_name, notes, status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else {
+      return res.status(400).json({ error: 'Invalid maintenance type' });
+    }
+    
+    await db.execute({ sql: query, args: args });
+    
+    res.json({ success: true, message: 'Equipment added successfully!' });
+  } catch (err) {
+    console.error('Add equipment error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== RECORD SERVICE ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -718,7 +823,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
   }
 });
 
-// ========== EDIT MAINTENANCE ITEM (ALL users including storekeeper) ==========
+// ========== EDIT MAINTENANCE ITEM ==========
 app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -733,8 +838,6 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
     last_service_hours,
     last_service_year
   } = req.body;
-  
-  // ALLOW ALL AUTHENTICATED USERS (including storekeeper) - No role check
   
   try {
     const existing = await db.execute({ sql: 'SELECT * FROM gse_maintenance WHERE id = ?', args: [id] });
@@ -826,7 +929,7 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== DELETE FROM MAINTENANCE (Admin/Manager only) ==========
+// ========== DELETE FROM MAINTENANCE ==========
 app.delete('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager only' });
@@ -987,7 +1090,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 Permissions: Edit/Add/Record for ALL users | Delete only for Admin/Manager');
+  console.log('📅 Add Equipment endpoint fixed');
 };
 
 init();
@@ -999,9 +1102,4 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Permissions:`);
-  console.log(`   ✅ Edit Equipment: ALL users`);
-  console.log(`   ✅ Record Service: ALL users`);
-  console.log(`   ✅ Add Equipment: ALL users`);
-  console.log(`   🗑️ Delete Equipment: Admin/Manager only`);
 });
