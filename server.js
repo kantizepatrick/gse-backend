@@ -130,6 +130,17 @@ const createTables = async () => {
   }
 };
 
+// ========== ENSURE COLUMN EXISTS (for existing databases) ==========
+const ensureColumns = async () => {
+  try {
+    await db.execute(`ALTER TABLE gse_maintenance ADD COLUMN last_service_full_date TEXT`);
+    console.log('✅ Added column: last_service_full_date');
+  } catch (err) {
+    // Column already exists - ignore
+    console.log('ℹ️ Column last_service_full_date already exists');
+  }
+};
+
 // ========== CREATE SAMPLE DATA ==========
 const createSampleData = async () => {
   const sampleParts = [
@@ -157,8 +168,11 @@ const createSampleData = async () => {
     }
   }
   
-  const today = '2026-05-27';
+  const today = new Date().toISOString().split('T')[0];
   const currentYear = new Date().getFullYear();
+  const currentDate = new Date();
+  const nextYearDate = new Date(currentDate);
+  nextYearDate.setFullYear(currentDate.getFullYear() + 1);
   
   const sampleEquipment = [
     ['Tow Tractor #5', 'Tow Tractor', 'hour', 250, 'Oil change, Filter replaced', 'John Smith', today, 0, null, null],
@@ -300,15 +314,15 @@ const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
   };
 };
 
-// ========== YEAR CALCULATION (Full Date Support - YYYY-MM-DD) ==========
+// ========== YEAR CALCULATION (Full Date Support) ==========
 const calculateYearStatus = (lastServiceFullDate, intervalYears) => {
   if (!lastServiceFullDate) {
     return { 
       years_remaining: intervalYears, 
       status: 'serviced', 
       nextDueDate: null, 
-      monthsRemaining: intervalYears * 12, 
       daysRemaining: intervalYears * 365,
+      monthsRemaining: intervalYears * 12,
       nextServiceFullDate: null
     };
   }
@@ -521,8 +535,8 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         const calc = calculateMonthStatus(item.last_service_date, item.service_interval_months);
         return { ...item, status: calc.status, days_remaining: calc.days_remaining, next_due_display: calc.nextDueDate, daysOverdue: calc.daysOverdue, current_service_display: item.last_service_date || 'Not recorded', next_service_column: calc.days_remaining > 0 ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : `🔴 OVERDUE by ${calc.daysOverdue} days` };
       } else if (item.maintenance_type === 'year' && item.service_interval_years) {
-        // Use last_service_full_date if available, otherwise fall back to last_service_year
-        const lastFullDate = item.last_service_full_date || (item.last_service_year ? `${item.last_service_year}-01-01` : null);
+        // Use last_service_full_date if available
+        const lastFullDate = item.last_service_full_date;
         const calc = calculateYearStatus(lastFullDate, item.service_interval_years);
         
         let next_service_column = '';
@@ -673,7 +687,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         notes || '', 
         serviceDateValue,
         new Date(serviceDateValue).getFullYear(),
-        newInterval, 
+        newInterval,
         id
       ];
       
@@ -877,9 +891,10 @@ app.get('/api/debug/users', async (req, res) => {
   }
 });
 
-// ========== INITIALIZE ==========
+// ========== ENSURE COLUMN AND INITIALIZE ==========
 const init = async () => {
   await createTables();
+  await ensureColumns();  // Add this to add missing column
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
@@ -898,8 +913,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
   console.log(`\n🔧 Year-based Features:`);
-  console.log(`   ✅ Full Date Support (YYYY-MM-DD)`);
-  console.log(`   ✅ Next Service = Service Date + Interval Years`);
+  console.log(`   ✅ Full Date Support (YYYY-MM-DD) via last_service_full_date column`);
+  console.log(`   ✅ Next Service = Service Date + Interval Years (same month/day)`);
   console.log(`   ✅ Due Soon when ≤ 30 days remaining`);
   console.log(`   ✅ Shows days and months remaining`);
 });
