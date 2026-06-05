@@ -3,7 +3,6 @@ const { createClient } = require('@libsql/client');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
@@ -11,22 +10,6 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = 'gse_inventory_secret_key_2024';
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, 'uploads');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
-const upload = multer({ storage: storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
 const allowedOrigins = [
   'http://localhost:3000',
@@ -47,8 +30,8 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
@@ -135,7 +118,8 @@ const createTables = async () => {
       maintenance_id INTEGER,
       filename TEXT NOT NULL,
       original_filename TEXT NOT NULL,
-      file_path TEXT NOT NULL,
+      file_data TEXT,
+      file_type TEXT,
       file_size INTEGER,
       uploaded_by TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -187,25 +171,12 @@ const ensureColumns = async () => {
     } catch (err) {}
   }
   try {
-    await db.execute(`CREATE TABLE IF NOT EXISTS maintenance_checklist (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      maintenance_id INTEGER,
-      checklist_item TEXT NOT NULL,
-      is_checked BOOLEAN DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await db.execute(`ALTER TABLE maintenance_attachments ADD COLUMN file_data TEXT`);
+    console.log('✅ Added column: file_data');
   } catch (err) {}
   try {
-    await db.execute(`CREATE TABLE IF NOT EXISTS maintenance_attachments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      maintenance_id INTEGER,
-      filename TEXT NOT NULL,
-      original_filename TEXT NOT NULL,
-      file_path TEXT NOT NULL,
-      file_size INTEGER,
-      uploaded_by TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await db.execute(`ALTER TABLE maintenance_attachments ADD COLUMN file_type TEXT`);
+    console.log('✅ Added column: file_type');
   } catch (err) {}
 };
 
@@ -237,9 +208,6 @@ const createSampleData = async () => {
   }
   
   const today = new Date().toISOString().split('T')[0];
-  const nextDate = new Date();
-  nextDate.setMonth(nextDate.getMonth() + 6);
-  const nextDateStr = nextDate.toISOString().split('T')[0];
   const currentYear = new Date().getFullYear();
   
   const sampleEquipment = [
@@ -254,7 +222,7 @@ const createSampleData = async () => {
   for (const eq of sampleEquipment) {
     const existing = await db.execute({ sql: 'SELECT id FROM gse_maintenance WHERE equipment_name = ?', args: [eq[0]] });
     if (existing.rows.length === 0) {
-      const nextServiceDate = eq[2] === 'hour' && eq[4] > 0 ? nextDateStr : null;
+      const nextServiceDate = eq[2] === 'hour' && eq[4] > 0 ? new Date(new Date().setMonth(new Date().getMonth() + eq[4])).toISOString().split('T')[0] : null;
       await db.execute({
         sql: `INSERT INTO gse_maintenance 
               (equipment_name, equipment_type, maintenance_type, service_interval_hours, service_interval_months_for_hour,
@@ -384,7 +352,7 @@ const calculateDualStatus = (item) => {
   };
 };
 
-// ========== MONTH CALCULATION (Unchanged) ==========
+// ========== MONTH CALCULATION ==========
 const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
   if (!lastServiceDate) {
     return { days_remaining: intervalMonths * 30, status: 'serviced', nextDueDate: null, daysOverdue: 0 };
@@ -414,7 +382,7 @@ const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
   };
 };
 
-// ========== YEAR CALCULATION (Unchanged) ==========
+// ========== YEAR CALCULATION ==========
 const calculateYearStatus = (lastServiceFullDate, intervalYears) => {
   if (!lastServiceFullDate) {
     return { 
@@ -603,7 +571,7 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== UPDATE CURRENT HOURS (Manual Entry) ==========
+// ========== UPDATE CURRENT HOURS ==========
 app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { current_hours } = req.body;
@@ -647,31 +615,28 @@ app.post('/api/maintenance-checklist/:maintenanceId', authenticateToken, async (
   }
 });
 
-// ========== UPLOAD ATTACHMENT ==========
-app.post('/api/maintenance-attachment/:maintenanceId', authenticateToken, upload.single('file'), async (req, res) => {
+// ========== UPLOAD ATTACHMENT (Base64 - Works on Render) ==========
+app.post('/api/maintenance-attachment/:maintenanceId', authenticateToken, async (req, res) => {
   const { maintenanceId } = req.params;
-  const file = req.file;
+  const { filename, file_data, file_type } = req.body;
   
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
+  if (!filename || !file_data) {
+    return res.status(400).json({ error: 'No file data provided' });
   }
   
   try {
+    const fileSize = Math.ceil(file_data.length * 0.75);
+    
     await db.execute({
-      sql: `INSERT INTO maintenance_attachments (maintenance_id, filename, original_filename, file_path, file_size, uploaded_by)
-            VALUES (?, ?, ?, ?, ?, ?)`,
-      args: [maintenanceId, file.filename, file.originalname, file.path, file.size, req.user.username]
+      sql: `INSERT INTO maintenance_attachments (maintenance_id, filename, original_filename, file_data, file_type, file_size, uploaded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      args: [maintenanceId, filename, filename, file_data, file_type || 'application/octet-stream', fileSize, req.user.username]
     });
     
     res.json({ 
       success: true, 
       message: 'File uploaded successfully',
-      file: {
-        filename: file.filename,
-        originalname: file.originalname,
-        size: file.size,
-        path: `/uploads/${file.filename}`
-      }
+      file: { filename: filename, type: file_type }
     });
   } catch (err) {
     console.error('Upload error:', err.message);
@@ -683,10 +648,35 @@ app.post('/api/maintenance-attachment/:maintenanceId', authenticateToken, upload
 app.get('/api/maintenance-attachments/:maintenanceId', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute({ 
-      sql: 'SELECT * FROM maintenance_attachments WHERE maintenance_id = ? ORDER BY created_at DESC', 
+      sql: 'SELECT id, filename, original_filename, file_type, file_size, uploaded_by, created_at FROM maintenance_attachments WHERE maintenance_id = ? ORDER BY created_at DESC', 
       args: [req.params.maintenanceId] 
     });
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== DOWNLOAD ATTACHMENT ==========
+app.get('/api/maintenance-attachment/:id/download', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const result = await db.execute({ 
+      sql: 'SELECT original_filename, file_data, file_type FROM maintenance_attachments WHERE id = ?', 
+      args: [id] 
+    });
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    
+    const file = result.rows[0];
+    const fileBuffer = Buffer.from(file.file_data, 'base64');
+    
+    res.setHeader('Content-Type', file.file_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${file.original_filename}"`);
+    res.send(fileBuffer);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -697,14 +687,7 @@ app.delete('/api/maintenance-attachment/:id', authenticateToken, async (req, res
   const { id } = req.params;
   
   try {
-    const result = await db.execute({ sql: 'SELECT file_path FROM maintenance_attachments WHERE id = ?', args: [id] });
-    if (result.rows.length > 0) {
-      const filePath = result.rows[0].file_path;
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-      await db.execute({ sql: 'DELETE FROM maintenance_attachments WHERE id = ?', args: [id] });
-    }
+    await db.execute({ sql: 'DELETE FROM maintenance_attachments WHERE id = ?', args: [id] });
     res.json({ success: true, message: 'Attachment deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -725,6 +708,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
           status: calc.status, 
           current_hours: calc.current_hours, 
           remaining_hours: calc.remaining_hours, 
+          days_remaining: calc.days_remaining,
           next_due_display: calc.next_due_display, 
           alert_reason: calc.alert_reason,
           current_service_display: item.last_service_date ? `${item.last_service_date} (Current: ${calc.current_hours} hrs, Target: ${calc.targetHours} hrs)${item.next_service_date ? ` | Next Date: ${new Date(item.next_service_date).toLocaleDateString()}` : ''}` : 'Not recorded',
@@ -1048,7 +1032,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     let monthsIntervalValue = months_interval !== undefined ? parseInt(months_interval) : 0;
     let next_service_date = null;
     
-    // Calculate next service date if months interval provided
     if (monthsIntervalValue > 0) {
       const date = new Date(serviceDateValue);
       date.setMonth(date.getMonth() + monthsIntervalValue);
@@ -1140,7 +1123,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     await db.execute({ sql: updateQuery, args: updateArgs });
     
-    // Save checklist if provided
     if (checklist && checklist.length > 0) {
       await db.execute({ sql: 'DELETE FROM maintenance_checklist WHERE maintenance_id = ?', args: [id] });
       for (const item of checklist) {
@@ -1157,7 +1139,9 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     let nextDateFormatted = '';
     
     if (maintenanceType === 'hour') {
-      nextServiceInfo = `Next service when meter reaches ${targetHoursValue} hours`;
+      const interval = service_interval_hours || 250;
+      const target = currentHoursValue + interval;
+      nextServiceInfo = `Next service when meter reaches ${target} hours`;
       if (next_service_date) {
         nextServiceInfo += ` OR by date ${new Date(next_service_date).toLocaleDateString()} (whichever comes first)`;
         nextDateFormatted = new Date(next_service_date).toLocaleDateString();
@@ -1197,13 +1181,6 @@ app.delete('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
     return res.status(403).json({ error: 'Admin or Manager only' });
   }
   try {
-    // Delete attachments files first
-    const attachments = await db.execute({ sql: 'SELECT file_path FROM maintenance_attachments WHERE maintenance_id = ?', args: [req.params.id] });
-    for (const att of attachments.rows) {
-      if (fs.existsSync(att.file_path)) {
-        fs.unlinkSync(att.file_path);
-      }
-    }
     await db.execute({ sql: 'DELETE FROM maintenance_attachments WHERE maintenance_id = ?', args: [req.params.id] });
     await db.execute({ sql: 'DELETE FROM maintenance_checklist WHERE maintenance_id = ?', args: [req.params.id] });
     await db.execute({ sql: 'DELETE FROM gse_maintenance WHERE id = ?', args: [req.params.id] });
@@ -1360,9 +1337,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📅 DUAL CONDITION for Hour-based: Date AND Hours with manual hour entry');
-  console.log('📎 File attachment support enabled');
-  console.log('📋 Checklist support enabled');
+  console.log('📎 Base64 file attachment storage enabled (works on Render)');
 };
 
 init();
@@ -1374,9 +1349,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
-  console.log(`\n🔧 Dual Condition Hour-based:`);
-  console.log(`   📅 Record service: Enter date + months interval → auto-calculates next service date`);
-  console.log(`   ⏱️ Record service: Enter current hours + target hours`);
-  console.log(`   📊 System compares BOTH conditions and alerts on whichever comes FIRST`);
-  console.log(`   📝 User updates current hours daily via "Update Hours" button`);
+  console.log(`\n📎 Attachment Storage:`);
+  console.log(`   Files stored as Base64 in database - works on Render without file system issues`);
 });
