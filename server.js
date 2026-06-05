@@ -3,8 +3,6 @@ const { createClient } = require('@libsql/client');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -170,14 +168,6 @@ const ensureColumns = async () => {
       console.log(`✅ Added column: ${column}`);
     } catch (err) {}
   }
-  try {
-    await db.execute(`ALTER TABLE maintenance_attachments ADD COLUMN file_data TEXT`);
-    console.log('✅ Added column: file_data');
-  } catch (err) {}
-  try {
-    await db.execute(`ALTER TABLE maintenance_attachments ADD COLUMN file_type TEXT`);
-    console.log('✅ Added column: file_type');
-  } catch (err) {}
 };
 
 // ========== CREATE SAMPLE DATA ==========
@@ -283,7 +273,6 @@ const calculateDualStatus = (item) => {
   let targetHours = item.target_hours || item.service_interval_hours || 0;
   let remaining_hours = targetHours - current_hours;
   
-  // Calculate hours-based status
   let hourStatus = null;
   if (targetHours > 0) {
     if (remaining_hours <= 0) {
@@ -295,7 +284,6 @@ const calculateDualStatus = (item) => {
     }
   }
   
-  // Calculate date-based status if next_service_date exists
   let dateStatus = null;
   let days_remaining = null;
   let nextDateStr = null;
@@ -314,20 +302,16 @@ const calculateDualStatus = (item) => {
     }
   }
   
-  // Determine final status - whichever is worse (overdue > due_soon > serviced)
   if (hourStatus === 'overdue' || dateStatus === 'overdue') {
     finalStatus = 'overdue';
     if (hourStatus === 'overdue') alert_reason = `Hours: ${Math.abs(remaining_hours)} hrs over target`;
     if (dateStatus === 'overdue') alert_reason = `Date: ${Math.abs(days_remaining)} days overdue`;
-    if (hourStatus === 'overdue' && dateStatus === 'overdue') alert_reason = 'Both hours and date are overdue';
   } else if (hourStatus === 'due_soon' || dateStatus === 'due_soon') {
     finalStatus = 'due_soon';
     if (hourStatus === 'due_soon') alert_reason = `${remaining_hours} hours to target`;
     if (dateStatus === 'due_soon') alert_reason = `${days_remaining} days to service`;
-    if (hourStatus === 'due_soon' && dateStatus === 'due_soon') alert_reason = `${remaining_hours} hrs OR ${days_remaining} days`;
   }
   
-  // Build next service display
   if (targetHours > 0 && item.next_service_date) {
     next_due_display = `📅 ${nextDateStr} OR ⏱️ ${targetHours} hrs (Current: ${current_hours} hrs)`;
     if (remaining_hours > 0) next_due_display += ` | ${remaining_hours} hrs to target`;
@@ -615,7 +599,21 @@ app.post('/api/maintenance-checklist/:maintenanceId', authenticateToken, async (
   }
 });
 
-// ========== UPLOAD ATTACHMENT (Base64 - Works on Render) ==========
+// ========== GET ATTACHMENTS ==========
+app.get('/api/maintenance-attachments/:maintenanceId', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.execute({ 
+      sql: 'SELECT id, filename, original_filename, file_type, file_size, uploaded_by, created_at FROM maintenance_attachments WHERE maintenance_id = ? ORDER BY created_at DESC', 
+      args: [req.params.maintenanceId] 
+    });
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get attachments error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== UPLOAD ATTACHMENT ==========
 app.post('/api/maintenance-attachment/:maintenanceId', authenticateToken, async (req, res) => {
   const { maintenanceId } = req.params;
   const { filename, file_data, file_type } = req.body;
@@ -644,19 +642,6 @@ app.post('/api/maintenance-attachment/:maintenanceId', authenticateToken, async 
   }
 });
 
-// ========== GET ATTACHMENTS ==========
-app.get('/api/maintenance-attachments/:maintenanceId', authenticateToken, async (req, res) => {
-  try {
-    const result = await db.execute({ 
-      sql: 'SELECT id, filename, original_filename, file_type, file_size, uploaded_by, created_at FROM maintenance_attachments WHERE maintenance_id = ? ORDER BY created_at DESC', 
-      args: [req.params.maintenanceId] 
-    });
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ========== DOWNLOAD ATTACHMENT ==========
 app.get('/api/maintenance-attachment/:id/download', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -672,12 +657,19 @@ app.get('/api/maintenance-attachment/:id/download', authenticateToken, async (re
     }
     
     const file = result.rows[0];
+    
+    if (!file.file_data) {
+      return res.status(404).json({ error: 'File data not found' });
+    }
+    
     const fileBuffer = Buffer.from(file.file_data, 'base64');
     
-    res.setHeader('Content-Type', file.file_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${file.original_filename}"`);
+    res.setHeader('Content-Type', file.file_type || 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${file.original_filename}"`);
+    res.setHeader('Content-Length', fileBuffer.length);
     res.send(fileBuffer);
   } catch (err) {
+    console.error('Download error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1337,7 +1329,7 @@ const init = async () => {
   await createUsers();
   await createSampleData();
   console.log('✅ All data initialized');
-  console.log('📎 Base64 file attachment storage enabled (works on Render)');
+  console.log('📎 Base64 file attachment storage enabled');
 };
 
 init();
@@ -1350,5 +1342,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   manager / manager123 (Manager)`);
   console.log(`   storekeeper / keeper123 (Storekeeper)`);
   console.log(`\n📎 Attachment Storage:`);
-  console.log(`   Files stored as Base64 in database - works on Render without file system issues`);
+  console.log(`   Files stored as Base64 in database`);
+  console.log(`   Download via: /api/maintenance-attachment/:id/download`);
 });
