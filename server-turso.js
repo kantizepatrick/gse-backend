@@ -13,10 +13,10 @@ const SECRET_KEY = 'gse_inventory_secret_key_2024';
 app.use(cors());
 app.use(express.json());
 
-// Turso database connection
+// Turso database connection (persistent SQLite in cloud!)
 const db = createClient({
-  url: process.env.TURSO_DATABASE_URL || 'libsql://gse-inventory-kantizepatrick.aws-eu-west-1.turso.io',
-  authToken: process.env.TURSO_AUTH_TOKEN || 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3NzkxOTgwOTcsImlkIjoiMDE5ZTQwNzYtNWMwMS03ODIwLWE5NzQtNWQ5OTI4MzE1M2NlIiwicmlkIjoiMGQzZTI2MDQtODg3OC00OTdmLThiMDktZmI2YWY2MWExNzMxIn0.7aqL_8q0hK-ZCgf8IJt0TPrQUI6kQU-ddPIK7lDGB_VeXzJNVU35XUzGaz2ffrQ4z213zFQrOQUIHrlu5jPbDw'
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
 });
 
 console.log('✅ Connected to Turso cloud database');
@@ -39,6 +39,54 @@ const setupEmail = async () => {
   }
 };
 setupEmail();
+
+// Create tables
+const createTables = async () => {
+  try {
+    await db.execute(`CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      full_name TEXT,
+      role TEXT DEFAULT 'storekeeper',
+      email TEXT
+    )`);
+    
+    await db.execute(`CREATE TABLE IF NOT EXISTS parts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      part_number TEXT UNIQUE NOT NULL,
+      description TEXT,
+      manufacturer TEXT,
+      compatible_gse TEXT,
+      location_bin TEXT,
+      quantity_on_hand INTEGER DEFAULT 0,
+      min_stock INTEGER DEFAULT 5,
+      contact_person TEXT,
+      contact_phone TEXT,
+      contact_email TEXT
+    )`);
+    
+    await db.execute(`CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      part_id INTEGER,
+      transaction_type TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      gse_registration TEXT,
+      technician_name TEXT,
+      work_order TEXT,
+      reference_number TEXT,
+      created_by TEXT,
+      notes TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (part_id) REFERENCES parts(id)
+    )`);
+    
+    console.log('✅ Tables ready in Turso');
+  } catch (err) {
+    console.error('Table error:', err.message);
+  }
+};
+createTables();
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
@@ -88,10 +136,9 @@ app.get('/api/parts', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECEIVE PARTS (INCREASES STOCK) ==========
+// ========== RECEIVE PARTS ==========
 app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
-  console.log(`📦 RECEIVE: ${part_number}, Qty: ${quantity}`);
   try {
     const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
     if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
@@ -101,7 +148,6 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
     await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, reference_number, notes, created_by) VALUES (?, ?, ?, ?, ?, ?)', args: [part.id, 'RECEIVE', quantityNum, reference_number, notes, req.user.username] });
     await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand + ? WHERE id = ?', args: [quantityNum, part.id] });
     await db.execute('COMMIT');
-    console.log(`✅ Stock increased by ${quantityNum}`);
     res.json({ message: 'Parts received successfully', added: quantityNum });
   } catch (err) {
     await db.execute('ROLLBACK');
@@ -109,10 +155,9 @@ app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== ISSUE PARTS (DECREASES STOCK) ==========
+// ========== ISSUE PARTS ==========
 app.post('/api/transactions/issue', authenticateToken, async (req, res) => {
   const { part_number, quantity, gse_registration, technician_name, work_order, notes } = req.body;
-  console.log(`📤 ISSUE: ${part_number}, Qty: ${quantity}`);
   try {
     const partResult = await db.execute({ sql: 'SELECT id, quantity_on_hand FROM parts WHERE part_number = ?', args: [part_number] });
     if (partResult.rows.length === 0) return res.status(404).json({ error: 'Part not found' });
@@ -123,7 +168,6 @@ app.post('/api/transactions/issue', authenticateToken, async (req, res) => {
     await db.execute({ sql: 'INSERT INTO transactions (part_id, transaction_type, quantity, gse_registration, technician_name, work_order, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', args: [part.id, 'ISSUE', quantityNum, gse_registration, technician_name, work_order, notes, req.user.username] });
     await db.execute({ sql: 'UPDATE parts SET quantity_on_hand = quantity_on_hand - ? WHERE id = ?', args: [quantityNum, part.id] });
     await db.execute('COMMIT');
-    console.log(`✅ Stock decreased by ${quantityNum}`);
     res.json({ message: 'Parts issued successfully', removed: quantityNum });
   } catch (err) {
     await db.execute('ROLLBACK');
@@ -172,7 +216,11 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
     });
     res.json({ id: result.lastInsertRowid, message: 'Part created successfully' });
   } catch (err) {
-    res.status(500).json({ error: 'Part number already exists' });
+    if (err.message.includes('UNIQUE')) {
+      res.status(500).json({ error: 'Part number already exists' });
+    } else {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
@@ -181,7 +229,13 @@ app.put('/api/parts/:id', authenticateToken, async (req, res) => {
   const { contact_person, contact_phone, contact_email, location_bin, min_stock } = req.body;
   try {
     await db.execute({ 
-      sql: `UPDATE parts SET contact_person = ?, contact_phone = ?, contact_email = ?, location_bin = ?, min_stock = ? WHERE id = ?`, 
+      sql: `UPDATE parts SET 
+            contact_person = ?, 
+            contact_phone = ?, 
+            contact_email = ?, 
+            location_bin = ?, 
+            min_stock = ? 
+            WHERE id = ?`, 
       args: [contact_person, contact_phone, contact_email, location_bin, min_stock, req.params.id] 
     });
     res.json({ message: 'Part updated successfully' });
@@ -347,10 +401,55 @@ app.get('/api/debug/users', async (req, res) => {
   }
 });
 
+app.post('/api/debug/create-users', async (req, res) => {
+  try {
+    const defaultUsers = [
+      ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
+      ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
+      ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
+    ];
+    for (const user of defaultUsers) {
+      await db.execute({ 
+        sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
+        args: user 
+      });
+    }
+    const result = await db.execute('SELECT id, username, role FROM users');
+    res.json({ success: true, users: result.rows });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ========== CREATE DEFAULT USERS ==========
+const createDefaultUsers = async () => {
+  const defaultUsers = [
+    ['admin', bcrypt.hashSync('admin123', 10), 'System Admin', 'admin', 'admin@example.com'],
+    ['manager', bcrypt.hashSync('manager123', 10), 'GSE Manager', 'manager', 'manager@example.com'],
+    ['storekeeper', bcrypt.hashSync('keeper123', 10), 'Store Keeper', 'storekeeper', 'storekeeper@example.com']
+  ];
+  for (const user of defaultUsers) {
+    try {
+      await db.execute({ 
+        sql: `INSERT OR IGNORE INTO users (username, password_hash, full_name, role, email) VALUES (?, ?, ?, ?, ?)`, 
+        args: user 
+      });
+      console.log(`✅ User ${user[0]} created/verified`);
+    } catch (err) {
+      console.log(`Error creating user ${user[0]}:`, err.message);
+    }
+  }
+  const result = await db.execute('SELECT username FROM users');
+  console.log(`📋 Total users in database: ${result.rows.length}`);
+  console.log(`📋 Users: ${result.rows.map(u => u.username).join(', ')}`);
+};
+
+setTimeout(createDefaultUsers, 3000);
+
 // ========== START SERVER ==========
 app.listen(PORT, () => {
   console.log(`✅ GSE Server running on port ${PORT}`);
-  console.log(`✅ Using Turso cloud database (data persists forever!)`);
+  console.log(`✅ Using Turso cloud database (persistent, never expires)`);
   console.log(`\n📋 Default Logins:`);
   console.log(`   admin / admin123 (Admin)`);
   console.log(`   manager / manager123 (Manager)`);
