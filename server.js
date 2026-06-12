@@ -271,10 +271,6 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ========== DUAL CONDITION HOUR CALCULATION ==========
-// This function implements the dual condition logic:
-// - Alert triggers on whichever condition comes FIRST (date OR hours)
-// - Due Soon: ≤ 4 days to date OR ≤ 40 hours to target
-// - Overdue: Date passed OR hours exceeded target
 const calculateDualStatus = (item) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -297,7 +293,6 @@ const calculateDualStatus = (item) => {
     } else {
       hourStatus = 'serviced';
     }
-    // Calculate approximate days equivalent (assuming 8 hours per day)
     hour_days_equivalent = Math.ceil(remaining_hours / 8);
   }
   
@@ -319,7 +314,6 @@ const calculateDualStatus = (item) => {
     }
   }
   
-  // Determine final status based on whichever condition comes FIRST
   if (hourStatus === 'overdue' || dateStatus === 'overdue') {
     finalStatus = 'overdue';
     if (hourStatus === 'overdue' && dateStatus === 'overdue') {
@@ -340,7 +334,6 @@ const calculateDualStatus = (item) => {
     }
   }
   
-  // Build display text
   if (targetHours > 0 && item.next_service_date) {
     next_due_display = `📅 ${nextDateStr} OR ⏱️ ${targetHours} hrs (Current: ${current_hours} hrs)`;
     if (remaining_hours > 0) next_due_display += ` | ${remaining_hours} hrs to target`;
@@ -377,10 +370,24 @@ const calculateDualStatus = (item) => {
   };
 };
 
-// ========== MONTH CALCULATION ==========
+// ========== MONTH CALCULATION (Fixed - uses exact months provided) ==========
 const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
   if (!lastServiceDate) {
-    return { days_remaining: intervalMonths * 30, status: 'serviced', nextDueDate: null, daysOverdue: 0 };
+    return { 
+      days_remaining: 999, 
+      status: 'serviced', 
+      nextDueDate: null, 
+      daysOverdue: 0 
+    };
+  }
+  
+  if (!intervalMonths || intervalMonths <= 0) {
+    return { 
+      days_remaining: 999, 
+      status: 'serviced', 
+      nextDueDate: null, 
+      daysOverdue: 0 
+    };
   }
   
   const lastDate = new Date(lastServiceDate);
@@ -607,7 +614,6 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
     today.setHours(0, 0, 0, 0);
     
     const itemsWithStatus = result.rows.map(item => {
-      // Convert BigInt safely
       const cleanItem = {};
       for (const [key, value] of Object.entries(item)) {
         cleanItem[key] = typeof value === 'bigint' ? Number(value) : value;
@@ -632,7 +638,6 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       let alert_reason = '';
       
       if (cleanItem.maintenance_type === 'hour') {
-        // DUAL CONDITION LOGIC for Hour-based maintenance
         const calc = calculateDualStatus(cleanItem);
         status = calc.status;
         remaining_display = calc.next_due_display;
@@ -792,9 +797,12 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
         req.user.username
       ];
     } else if (maintenance_type === 'month') {
+      if (!service_interval_months) {
+        return res.status(400).json({ error: 'Service interval months is required for month-based maintenance' });
+      }
       if (last_service_date) {
         const date = new Date(last_service_date);
-        date.setMonth(date.getMonth() + (service_interval_months || 6));
+        date.setMonth(date.getMonth() + service_interval_months);
         next_service_date = date.toISOString().split('T')[0];
       }
       
@@ -808,7 +816,7 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
         equipment_name,
         equipment_type || '',
         maintenance_type,
-        service_interval_months || 6,
+        service_interval_months,
         last_service_date || null,
         next_service_date,
         service_performed || '',
@@ -885,8 +893,11 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
       updateQuery = `UPDATE gse_maintenance SET equipment_name = ?, equipment_type = ?, maintenance_type = ?, service_interval_hours = ?, target_hours = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
       updateArgs = [equipment_name, equipment_type || '', maintenance_type, service_interval_hours || 250, service_interval_hours || 250, id];
     } else if (maintenance_type === 'month') {
+      if (!service_interval_months) {
+        return res.status(400).json({ error: 'Service interval months is required for month-based maintenance' });
+      }
       updateQuery = `UPDATE gse_maintenance SET equipment_name = ?, equipment_type = ?, maintenance_type = ?, service_interval_months = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
-      updateArgs = [equipment_name, equipment_type || '', maintenance_type, service_interval_months || 6, id];
+      updateArgs = [equipment_name, equipment_type || '', maintenance_type, service_interval_months, id];
     } else if (maintenance_type === 'year') {
       updateQuery = `UPDATE gse_maintenance SET equipment_name = ?, equipment_type = ?, maintenance_type = ?, service_interval_years = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
       updateArgs = [equipment_name, equipment_type || '', maintenance_type, service_interval_years || 1, id];
@@ -915,7 +926,6 @@ app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) =>
   const { current_hours } = req.body;
   
   try {
-    // Get current equipment to check maintenance type
     const equipmentResult = await db.execute({ 
       sql: 'SELECT maintenance_type, target_hours, service_interval_hours FROM gse_maintenance WHERE id = ?', 
       args: [id] 
@@ -939,7 +949,6 @@ app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) =>
       args: [newHours, id] 
     });
     
-    // Calculate remaining and alert status
     const remainingHours = targetHours - newHours;
     let alertStatus = '';
     if (remainingHours <= 0) {
@@ -977,7 +986,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
   } = req.body;
   
   try {
-    // Get current equipment data
     const equipmentResult = await db.execute({ 
       sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
       args: [id] 
@@ -1004,7 +1012,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     let updateArgs = [];
     
     if (maintenanceType === 'hour') {
-      // Calculate next service date if months interval is provided (DATE CONDITION)
       if (monthsIntervalValue > 0) {
         const date = new Date(serviceDateValue);
         date.setMonth(date.getMonth() + monthsIntervalValue);
@@ -1041,7 +1048,11 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       ];
       
     } else if (maintenanceType === 'month') {
-      const interval = parseInt(monthsIntervalValue) || equipment.service_interval_months || 6;
+      if (!monthsIntervalValue || monthsIntervalValue <= 0) {
+        return res.status(400).json({ error: 'Valid months interval is required for month-based maintenance' });
+      }
+      
+      const interval = monthsIntervalValue;
       const nextDate = new Date(serviceDateValue);
       nextDate.setMonth(nextDate.getMonth() + interval);
       next_service_date = nextDate.toISOString().split('T')[0];
@@ -1102,7 +1113,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     await db.execute({ sql: updateQuery, args: updateArgs });
     
-    // Calculate next service info for response
     let nextServiceInfo = '';
     let nextDateFormatted = '';
     
@@ -1120,7 +1130,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     } else if (maintenanceType === 'month') {
       if (next_service_date) {
         nextDateFormatted = new Date(next_service_date).toLocaleDateString();
-        nextServiceInfo = `Next service due on ${nextDateFormatted}`;
+        nextServiceInfo = `Next service due on ${nextDateFormatted} (${monthsIntervalValue} month interval)`;
       } else {
         nextServiceInfo = 'Service recorded';
       }
