@@ -345,9 +345,9 @@ const calculateDualStatus = (item) => {
   };
 };
 
-// ========== MONTH CALCULATION (FIXED - uses next_service_date like NIRO) ==========
+// ========== MONTH CALCULATION (NO FIXED INTERVAL - uses next_service_date) ==========
 const calculateMonthStatus = (item) => {
-  // Use next_service_date instead of last_service_date (like NIRO)
+  // Use next_service_date which is calculated based on user's entered interval
   if (!item.next_service_date) {
     return { days_remaining: 999, status: 'serviced', nextDueDate: null, daysOverdue: 0 };
   }
@@ -627,7 +627,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         };
         
       } else if (cleanItem.maintenance_type === 'month') {
-        // Use the fixed calculateMonthStatus that uses next_service_date
+        // Calculate status based on next_service_date (which was set by user's interval)
         const calc = calculateMonthStatus(cleanItem);
         status = calc.status;
         const interval = cleanItem.service_interval_months || '?';
@@ -932,7 +932,7 @@ app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) =>
   }
 });
 
-// ========== RECORD SERVICE (FIXED - based on NIRO working code) ==========
+// ========== RECORD SERVICE (FIXED - NO FIXED INTERVAL) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -1009,10 +1009,16 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       ];
       
     } else if (maintenanceType === 'month') {
-      // FIXED: Use the months_interval from the request body (what user typed)
-      const interval = months_interval !== undefined ? parseInt(months_interval) : (service_interval_months || 6);
+      // NO FIXED INTERVAL - Use exactly what the user typed
+      const interval = monthsIntervalValue;
       
-      // Calculate next service date based on the interval
+      if (!interval || interval <= 0) {
+        return res.status(400).json({ 
+          error: 'Please enter the number of months until next service (e.g., 1, 2, 3, 4, 6, 12) - NO default' 
+        });
+      }
+      
+      // Calculate next service date based on the interval the user entered
       const nextDate = new Date(serviceDateValue);
       nextDate.setMonth(nextDate.getMonth() + interval);
       const next_service_date_calc = nextDate.toISOString().split('T')[0];
@@ -1033,7 +1039,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         technician_name || '', 
         notes || '', 
         serviceDateValue,
-        interval,  // Save the interval the user entered
+        interval,
         next_service_date_calc,
         id
       ];
@@ -1093,7 +1099,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         nextDateFormatted = new Date(next_service_date).toLocaleDateString();
       }
     } else if (maintenanceType === 'month') {
-      const interval = months_interval !== undefined ? parseInt(months_interval) : (service_interval_months || 6);
+      const interval = monthsIntervalValue;
       const nextDate = new Date(serviceDateValue);
       nextDate.setMonth(nextDate.getMonth() + interval);
       nextDateFormatted = nextDate.toLocaleDateString();
