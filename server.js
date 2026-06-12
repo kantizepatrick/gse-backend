@@ -370,9 +370,8 @@ const calculateDualStatus = (item) => {
   };
 };
 
-// ========== MONTH CALCULATION (FIXED - uses next_service_date) ==========
+// ========== MONTH CALCULATION (Uses stored next_service_date) ==========
 const calculateMonthStatus = (item) => {
-  // For month-based maintenance, use next_service_date which is calculated when service is recorded
   if (!item.next_service_date) {
     return { 
       days_remaining: 999, 
@@ -596,12 +595,10 @@ app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET MAINTENANCE (with Dual Condition Status) ==========
+// ========== GET MAINTENANCE ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM gse_maintenance ORDER BY equipment_name');
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
     
     const itemsWithStatus = result.rows.map(item => {
       const cleanItem = {};
@@ -679,6 +676,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
           alert_reason = '';
         }
         
+        const interval = cleanItem.service_interval_months;
         return {
           ...cleanItem,
           status,
@@ -687,7 +685,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
           remaining_display,
           alert_reason,
           current_service_display: cleanItem.last_service_date || 'Not recorded',
-          next_service_column: calc.nextDueDate ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : 'No date set'
+          next_service_column: calc.nextDueDate ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining) - ${interval} month interval` : 'No date set'
         };
         
       } else if (cleanItem.maintenance_type === 'year') {
@@ -962,7 +960,7 @@ app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) =>
   }
 });
 
-// ========== RECORD SERVICE ON MAINTENANCE (with Dual Condition) ==========
+// ========== RECORD SERVICE ON MAINTENANCE (FIXED - respects user's months interval) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -995,13 +993,13 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     const serviceDateValue = service_date || new Date().toISOString().split('T')[0];
     const currentHoursValue = current_hours !== undefined ? parseInt(current_hours) : (equipment.current_hours || 0);
     const targetHoursValue = target_hours !== undefined ? parseInt(target_hours) : (equipment.target_hours || equipment.service_interval_hours || 0);
-    const monthsIntervalValue = months_interval !== undefined ? parseInt(months_interval) : 0;
     
     let next_service_date = null;
     let updateQuery = '';
     let updateArgs = [];
     
     if (maintenanceType === 'hour') {
+      const monthsIntervalValue = months_interval !== undefined ? parseInt(months_interval) : 0;
       if (monthsIntervalValue > 0) {
         const date = new Date(serviceDateValue);
         date.setMonth(date.getMonth() + monthsIntervalValue);
@@ -1038,11 +1036,16 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       ];
       
     } else if (maintenanceType === 'month') {
-      if (!monthsIntervalValue || monthsIntervalValue <= 0) {
-        return res.status(400).json({ error: 'Valid months interval is required for month-based maintenance' });
+      // CRITICAL FIX: Use the months_interval from the request body - NO DEFAULT!
+      const interval = months_interval !== undefined ? parseInt(months_interval) : null;
+      
+      if (!interval || interval <= 0) {
+        return res.status(400).json({ 
+          error: 'Please enter the number of months until next service (e.g., 1, 2, 3, 4, 6, 12)' 
+        });
       }
       
-      const interval = monthsIntervalValue;
+      // Calculate next service date based on the interval the user entered
       const nextDate = new Date(serviceDateValue);
       nextDate.setMonth(nextDate.getMonth() + interval);
       next_service_date = nextDate.toISOString().split('T')[0];
@@ -1069,7 +1072,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       ];
       
     } else if (maintenanceType === 'year') {
-      const interval = parseInt(monthsIntervalValue) || equipment.service_interval_years || 1;
+      const interval = parseInt(months_interval) || equipment.service_interval_years || 1;
       const nextDate = new Date(serviceDateValue);
       nextDate.setFullYear(nextDate.getFullYear() + interval);
       next_service_date = nextDate.toISOString().split('T')[0];
@@ -1119,8 +1122,9 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       }
     } else if (maintenanceType === 'month') {
       if (next_service_date) {
+        const interval = months_interval;
         nextDateFormatted = new Date(next_service_date).toLocaleDateString();
-        nextServiceInfo = `Next service due on ${nextDateFormatted} (${monthsIntervalValue} month interval)`;
+        nextServiceInfo = `Next service due on ${nextDateFormatted} (${interval} month${interval !== 1 ? 's' : ''} from service date)`;
       } else {
         nextServiceInfo = 'Service recorded';
       }
@@ -1133,16 +1137,14 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       }
     }
     
-    console.log(`✅ Service recorded for ${equipment.equipment_name} by ${req.user.username}`);
+    console.log(`✅ Service recorded for ${equipment.equipment_name} by ${req.user.username} with interval: ${months_interval} months`);
     
     res.json({ 
       success: true, 
-      message: `✅ Service recorded!\n📅 Service Date: ${serviceDateValue}\n⏱️ Current Hours: ${currentHoursValue} hrs\n🎯 Target Hours: ${targetHoursValue} hrs\n📊 ${nextServiceInfo}`,
+      message: `✅ Service recorded!\n📅 Service Date: ${serviceDateValue}\n📊 ${nextServiceInfo}`,
       service_date: serviceDateValue,
-      current_hours: currentHoursValue,
-      target_hours: targetHoursValue,
       next_due: nextDateFormatted,
-      dual_condition: maintenanceType === 'hour' ? true : false
+      interval_used: months_interval
     });
     
   } catch (err) {
