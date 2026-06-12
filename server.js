@@ -658,6 +658,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
       } else if (cleanItem.maintenance_type === 'month') {
         const calc = calculateMonthStatus(cleanItem);
         status = calc.status;
+        const interval = cleanItem.service_interval_months || '?';
         
         if (status === 'overdue') {
           statusText = '🔴 OVERDUE';
@@ -676,7 +677,6 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
           alert_reason = '';
         }
         
-        const interval = cleanItem.service_interval_months;
         return {
           ...cleanItem,
           status,
@@ -960,7 +960,7 @@ app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) =>
   }
 });
 
-// ========== RECORD SERVICE ON MAINTENANCE (FIXED - respects user's months interval) ==========
+// ========== RECORD SERVICE ON MAINTENANCE (FIXED - saves user's months interval) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -1036,7 +1036,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       ];
       
     } else if (maintenanceType === 'month') {
-      // CRITICAL FIX: Use the months_interval from the request body - NO DEFAULT!
+      // CRITICAL: Use the months_interval from the request body
       const interval = months_interval !== undefined ? parseInt(months_interval) : null;
       
       if (!interval || interval <= 0) {
@@ -1050,6 +1050,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
       nextDate.setMonth(nextDate.getMonth() + interval);
       next_service_date = nextDate.toISOString().split('T')[0];
       
+      // IMPORTANT: Update service_interval_months with the new interval
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
@@ -1066,7 +1067,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         technician_name || '', 
         notes || '', 
         serviceDateValue,
-        interval,
+        interval,  // This saves the interval to service_interval_months column
         next_service_date,
         id
       ];
