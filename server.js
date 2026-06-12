@@ -32,6 +32,13 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// ========== FIX: Handle BigInt serialization ==========
+if (!BigInt.prototype.toJSON) {
+  BigInt.prototype.toJSON = function() {
+    return Number(this);
+  };
+}
+
 const db = createClient({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
@@ -429,17 +436,25 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ========== GET PARTS ==========
+// ========== GET PARTS (with BigInt fix) ==========
 app.get('/api/parts', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
-    res.json(result.rows);
+    const cleanParts = result.rows.map(part => {
+      const cleanPart = {};
+      for (const [key, value] of Object.entries(part)) {
+        cleanPart[key] = typeof value === 'bigint' ? Number(value) : value;
+      }
+      return cleanPart;
+    });
+    res.json(cleanParts);
   } catch (err) {
+    console.error('Error fetching parts:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== CREATE PART (Sync to Maintenance) ==========
+// ========== CREATE PART ==========
 app.post('/api/parts', authenticateToken, async (req, res) => {
   const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, contact_person, contact_phone, contact_email } = req.body;
   try {
@@ -457,14 +472,15 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
     } else {
       await db.execute({ sql: `INSERT INTO gse_maintenance (equipment_name, equipment_type, maintenance_type, part_id, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, args: [part_number, manufacturer || 'GSE Part', 'none', result.lastInsertRowid, req.user.username] });
     }
-    res.json({ message: 'Part added successfully with maintenance record!' });
+    const partId = typeof result.lastInsertRowid === 'bigint' ? Number(result.lastInsertRowid) : result.lastInsertRowid;
+    res.json({ message: 'Part added successfully with maintenance record!', id: partId });
   } catch (err) {
     console.error('Create part error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== UPDATE PART (Sync to Maintenance) ==========
+// ========== UPDATE PART ==========
 app.put('/api/parts/:id', authenticateToken, async (req, res) => {
   const { part_number, description, manufacturer, compatible_gse, location_bin, min_stock, maintenance_type, service_interval_hours, service_interval_months, service_interval_years, contact_person, contact_phone, contact_email } = req.body;
   
@@ -524,7 +540,7 @@ app.put('/api/parts/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== DELETE PART (Also deletes from Maintenance) ==========
+// ========== DELETE PART ==========
 app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager access required' });
@@ -552,24 +568,30 @@ app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET MAINTENANCE ==========
+// ========== GET MAINTENANCE (with BigInt fix) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM gse_maintenance ORDER BY equipment_name');
+    
     const itemsWithStatus = result.rows.map(item => {
-      if (item.maintenance_type === 'none') {
-        return { ...item, status: 'no_maintenance', current_service_display: 'No maintenance required', next_service_column: '⚪ No maintenance required' };
-      } else if (item.maintenance_type === 'hour') {
-        const calc = calculateDualStatus(item);
-        return { ...item, status: calc.status, current_hours: calc.current_hours, remaining_hours: calc.remaining_hours, days_remaining: calc.days_remaining, next_due_display: calc.next_due_display, alert_reason: calc.alert_reason, current_service_display: item.last_service_date ? `${item.last_service_date} (Current: ${calc.current_hours} hrs, Target: ${calc.targetHours} hrs)` : 'Not recorded', next_service_column: calc.next_due_display };
-      } else if (item.maintenance_type === 'month') {
-        const calc = calculateMonthStatus(item.last_service_date, item.service_interval_months);
-        return { ...item, status: calc.status, days_remaining: calc.days_remaining, next_due_display: calc.nextDueDate, daysOverdue: calc.daysOverdue, current_service_display: item.last_service_date || 'Not recorded', next_service_column: calc.days_remaining > 0 ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : `🔴 OVERDUE by ${calc.daysOverdue} days` };
-      } else if (item.maintenance_type === 'year') {
-        const calc = calculateYearStatus(item.last_service_full_date, item.service_interval_years);
-        return { ...item, status: calc.status, years_remaining: calc.years_remaining, next_due_display: calc.nextDueDate, current_service_display: item.last_service_full_date ? new Date(item.last_service_full_date).toLocaleDateString() : 'Not recorded', next_service_column: calc.status === 'overdue' ? `🔴 OVERDUE: Service was due on ${calc.nextDueDate}` : `📅 ${calc.nextDueDate} (${calc.daysRemaining} days remaining)` };
+      const cleanItem = {};
+      for (const [key, value] of Object.entries(item)) {
+        cleanItem[key] = typeof value === 'bigint' ? Number(value) : value;
       }
-      return item;
+      
+      if (cleanItem.maintenance_type === 'none') {
+        return { ...cleanItem, status: 'no_maintenance', current_service_display: 'No maintenance required', next_service_column: '⚪ No maintenance required' };
+      } else if (cleanItem.maintenance_type === 'hour') {
+        const calc = calculateDualStatus(cleanItem);
+        return { ...cleanItem, status: calc.status, current_hours: calc.current_hours, remaining_hours: calc.remaining_hours, days_remaining: calc.days_remaining, next_due_display: calc.next_due_display, alert_reason: calc.alert_reason, current_service_display: cleanItem.last_service_date ? `${cleanItem.last_service_date} (Current: ${calc.current_hours} hrs, Target: ${calc.targetHours} hrs)` : 'Not recorded', next_service_column: calc.next_due_display };
+      } else if (cleanItem.maintenance_type === 'month') {
+        const calc = calculateMonthStatus(cleanItem.last_service_date, cleanItem.service_interval_months);
+        return { ...cleanItem, status: calc.status, days_remaining: calc.days_remaining, next_due_display: calc.nextDueDate, daysOverdue: calc.daysOverdue, current_service_display: cleanItem.last_service_date || 'Not recorded', next_service_column: calc.days_remaining > 0 ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : `🔴 OVERDUE by ${calc.daysOverdue} days` };
+      } else if (cleanItem.maintenance_type === 'year') {
+        const calc = calculateYearStatus(cleanItem.last_service_full_date, cleanItem.service_interval_years);
+        return { ...cleanItem, status: calc.status, years_remaining: calc.years_remaining, next_due_display: calc.nextDueDate, current_service_display: cleanItem.last_service_full_date ? new Date(cleanItem.last_service_full_date).toLocaleDateString() : 'Not recorded', next_service_column: calc.status === 'overdue' ? `🔴 OVERDUE: Service was due on ${calc.nextDueDate}` : `📅 ${calc.nextDueDate} (${calc.daysRemaining} days remaining)` };
+      }
+      return cleanItem;
     });
     res.json({ success: true, equipment: itemsWithStatus });
   } catch (err) {
@@ -683,14 +705,15 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
     }
     
     const result = await db.execute({ sql: query, args: args });
-    res.json({ success: true, message: 'Equipment added successfully!', id: result.lastInsertRowid });
+    const newId = typeof result.lastInsertRowid === 'bigint' ? Number(result.lastInsertRowid) : result.lastInsertRowid;
+    res.json({ success: true, message: 'Equipment added successfully!', id: newId });
   } catch (err) {
     console.error('Add equipment error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== UPDATE MAINTENANCE (Sync back to Part) ==========
+// ========== UPDATE MAINTENANCE ==========
 app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { equipment_name, equipment_type, maintenance_type, service_interval_hours, service_interval_months, service_interval_years } = req.body;
@@ -842,7 +865,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
   }
 });
 
-// ========== DELETE MAINTENANCE (Only removes maintenance, updates part) ==========
+// ========== DELETE MAINTENANCE ==========
 app.delete('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin' && req.user.role !== 'manager') {
     return res.status(403).json({ error: 'Admin or Manager only' });
