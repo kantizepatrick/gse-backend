@@ -370,9 +370,10 @@ const calculateDualStatus = (item) => {
   };
 };
 
-// ========== MONTH CALCULATION (Fixed - uses exact months provided) ==========
-const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
-  if (!lastServiceDate) {
+// ========== MONTH CALCULATION (FIXED - uses next_service_date) ==========
+const calculateMonthStatus = (item) => {
+  // For month-based maintenance, use next_service_date which is calculated when service is recorded
+  if (!item.next_service_date) {
     return { 
       days_remaining: 999, 
       status: 'serviced', 
@@ -381,20 +382,9 @@ const calculateMonthStatus = (lastServiceDate, intervalMonths) => {
     };
   }
   
-  if (!intervalMonths || intervalMonths <= 0) {
-    return { 
-      days_remaining: 999, 
-      status: 'serviced', 
-      nextDueDate: null, 
-      daysOverdue: 0 
-    };
-  }
-  
-  const lastDate = new Date(lastServiceDate);
-  const nextDate = new Date(lastDate);
-  nextDate.setMonth(nextDate.getMonth() + intervalMonths);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+  const nextDate = new Date(item.next_service_date);
   const daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
   
   let status = 'serviced';
@@ -669,7 +659,7 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
         };
         
       } else if (cleanItem.maintenance_type === 'month') {
-        const calc = calculateMonthStatus(cleanItem.last_service_date, cleanItem.service_interval_months);
+        const calc = calculateMonthStatus(cleanItem);
         status = calc.status;
         
         if (status === 'overdue') {
