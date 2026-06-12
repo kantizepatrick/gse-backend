@@ -462,6 +462,123 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
   }
 });
 
+// ========== UPDATE PART (Edit Contact & Location Info) ==========
+app.put('/api/parts/:id', authenticateToken, async (req, res) => {
+  const { contact_person, contact_phone, contact_email, location_bin, min_stock } = req.body;
+  
+  try {
+    // Check if part exists
+    const partResult = await db.execute({ 
+      sql: 'SELECT part_number FROM parts WHERE id = ?', 
+      args: [req.params.id] 
+    });
+    
+    if (partResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
+    await db.execute({
+      sql: `UPDATE parts SET 
+            contact_person = ?, 
+            contact_phone = ?, 
+            contact_email = ?, 
+            location_bin = ?, 
+            min_stock = ?
+            WHERE id = ?`,
+      args: [
+        contact_person || '', 
+        contact_phone || '', 
+        contact_email || '', 
+        location_bin || '', 
+        min_stock || 5, 
+        req.params.id
+      ]
+    });
+    
+    console.log(`✅ Part "${partResult.rows[0].part_number}" updated by ${req.user.username} (${req.user.role})`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Part updated successfully' 
+    });
+  } catch (err) {
+    console.error('Update part error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== DELETE PART (Admin & Manager Only) ==========
+app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
+  // Only admin and manager can delete parts
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or Manager access required' });
+  }
+  
+  const partId = req.params.id;
+  
+  try {
+    // First check if part exists and get its info
+    const partResult = await db.execute({ 
+      sql: 'SELECT part_number, description FROM parts WHERE id = ?', 
+      args: [partId] 
+    });
+    
+    if (partResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Part not found' });
+    }
+    
+    const part = partResult.rows[0];
+    
+    // Check if part has any transaction history
+    const transResult = await db.execute({ 
+      sql: 'SELECT COUNT(*) as count FROM transactions WHERE part_id = ?', 
+      args: [partId] 
+    });
+    
+    if (transResult.rows[0].count > 0) {
+      return res.status(400).json({ 
+        error: `Cannot delete "${part.part_number}" - ${transResult.rows[0].count} transaction(s) exist. Archive instead?` 
+      });
+    }
+    
+    // Check for pending requests
+    const pendingResult = await db.execute({ 
+      sql: 'SELECT COUNT(*) as count FROM pending_issues WHERE part_id = ? AND status = "pending"', 
+      args: [partId] 
+    });
+    
+    if (pendingResult.rows[0].count > 0) {
+      return res.status(400).json({ 
+        error: `Cannot delete "${part.part_number}" - ${pendingResult.rows[0].count} pending request(s) exist.` 
+      });
+    }
+    
+    // Delete associated maintenance record if it exists (and is linked to this part)
+    await db.execute({ 
+      sql: 'DELETE FROM gse_maintenance WHERE part_id = ?', 
+      args: [partId] 
+    });
+    
+    // Delete the part
+    await db.execute({ 
+      sql: 'DELETE FROM parts WHERE id = ?', 
+      args: [partId] 
+    });
+    
+    console.log(`✅ Part "${part.part_number}" deleted by ${req.user.username} (${req.user.role})`);
+    
+    res.json({ 
+      success: true, 
+      message: `✓ Part "${part.part_number}" deleted successfully!`,
+      deleted_part: part.part_number
+    });
+    
+  } catch (err) {
+    console.error('Delete part error:', err.message);
+    res.status(500).json({ error: 'Database error: ' + err.message });
+  }
+});
+
 // ========== RECEIVE PARTS ==========
 app.post('/api/transactions/receive', authenticateToken, async (req, res) => {
   const { part_number, quantity, reference_number, notes } = req.body;
