@@ -472,8 +472,7 @@ app.post('/api/parts', authenticateToken, async (req, res) => {
     } else {
       await db.execute({ sql: `INSERT INTO gse_maintenance (equipment_name, equipment_type, maintenance_type, part_id, status, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, args: [part_number, manufacturer || 'GSE Part', 'none', result.lastInsertRowid, req.user.username] });
     }
-    const partId = typeof result.lastInsertRowid === 'bigint' ? Number(result.lastInsertRowid) : result.lastInsertRowid;
-    res.json({ message: 'Part added successfully with maintenance record!', id: partId });
+    res.json({ message: 'Part added successfully with maintenance record!' });
   } catch (err) {
     console.error('Create part error:', err.message);
     res.status(500).json({ error: err.message });
@@ -568,31 +567,167 @@ app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET MAINTENANCE (with BigInt fix) ==========
+// ========== GET MAINTENANCE (with correct status calculation) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM gse_maintenance ORDER BY equipment_name');
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
     
     const itemsWithStatus = result.rows.map(item => {
+      // Convert BigInt safely
       const cleanItem = {};
       for (const [key, value] of Object.entries(item)) {
         cleanItem[key] = typeof value === 'bigint' ? Number(value) : value;
       }
       
       if (cleanItem.maintenance_type === 'none') {
-        return { ...cleanItem, status: 'no_maintenance', current_service_display: 'No maintenance required', next_service_column: '⚪ No maintenance required' };
-      } else if (cleanItem.maintenance_type === 'hour') {
-        const calc = calculateDualStatus(cleanItem);
-        return { ...cleanItem, status: calc.status, current_hours: calc.current_hours, remaining_hours: calc.remaining_hours, days_remaining: calc.days_remaining, next_due_display: calc.next_due_display, alert_reason: calc.alert_reason, current_service_display: cleanItem.last_service_date ? `${cleanItem.last_service_date} (Current: ${calc.current_hours} hrs, Target: ${calc.targetHours} hrs)` : 'Not recorded', next_service_column: calc.next_due_display };
-      } else if (cleanItem.maintenance_type === 'month') {
-        const calc = calculateMonthStatus(cleanItem.last_service_date, cleanItem.service_interval_months);
-        return { ...cleanItem, status: calc.status, days_remaining: calc.days_remaining, next_due_display: calc.nextDueDate, daysOverdue: calc.daysOverdue, current_service_display: cleanItem.last_service_date || 'Not recorded', next_service_column: calc.days_remaining > 0 ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : `🔴 OVERDUE by ${calc.daysOverdue} days` };
-      } else if (cleanItem.maintenance_type === 'year') {
-        const calc = calculateYearStatus(cleanItem.last_service_full_date, cleanItem.service_interval_years);
-        return { ...cleanItem, status: calc.status, years_remaining: calc.years_remaining, next_due_display: calc.nextDueDate, current_service_display: cleanItem.last_service_full_date ? new Date(cleanItem.last_service_full_date).toLocaleDateString() : 'Not recorded', next_service_column: calc.status === 'overdue' ? `🔴 OVERDUE: Service was due on ${calc.nextDueDate}` : `📅 ${calc.nextDueDate} (${calc.daysRemaining} days remaining)` };
+        return { 
+          ...cleanItem, 
+          status: 'no_maintenance', 
+          statusText: '⚪ NO MAINTENANCE',
+          statusColor: '#95a5a6',
+          current_service_display: 'No maintenance required', 
+          next_service_column: '⚪ No maintenance required' 
+        };
       }
-      return cleanItem;
+      
+      // Calculate status based on maintenance type
+      let status = 'serviced';
+      let remaining_display = '';
+      let next_date_display = '';
+      let statusText = '✅ SERVICED';
+      let statusColor = '#27ae60';
+      
+      if (cleanItem.maintenance_type === 'hour') {
+        const currentHours = cleanItem.current_hours || 0;
+        const targetHours = cleanItem.target_hours || cleanItem.service_interval_hours || 0;
+        const remainingHours = targetHours - currentHours;
+        
+        if (targetHours > 0) {
+          if (remainingHours <= 0) {
+            status = 'overdue';
+            statusText = '🔴 OVERDUE';
+            statusColor = '#e74c3c';
+          } else if (remainingHours <= 40) {
+            status = 'due_soon';
+            statusText = '🟡 DUE SOON';
+            statusColor = '#f39c12';
+          }
+        }
+        
+        // Check date condition
+        let daysRemaining = null;
+        if (cleanItem.next_service_date) {
+          const nextDate = new Date(cleanItem.next_service_date);
+          daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
+          if (daysRemaining < 0) {
+            status = 'overdue';
+            statusText = '🔴 OVERDUE';
+            statusColor = '#e74c3c';
+          } else if (daysRemaining <= 4 && status !== 'overdue') {
+            status = 'due_soon';
+            statusText = '🟡 DUE SOON';
+            statusColor = '#f39c12';
+          }
+        }
+        
+        // Build display text
+        if (status === 'overdue') {
+          if (remainingHours <= 0 && daysRemaining && daysRemaining < 0) {
+            remaining_display = `Overdue: ${Math.abs(remainingHours)} hrs & ${Math.abs(daysRemaining)} days`;
+          } else if (remainingHours <= 0) {
+            remaining_display = `Overdue: ${Math.abs(remainingHours)} hours`;
+          } else if (daysRemaining && daysRemaining < 0) {
+            remaining_display = `Overdue: ${Math.abs(daysRemaining)} days`;
+          } else {
+            remaining_display = 'Overdue';
+          }
+        } else if (status === 'due_soon') {
+          if (remainingHours > 0 && remainingHours <= 40 && daysRemaining && daysRemaining > 0 && daysRemaining <= 4) {
+            remaining_display = `${remainingHours} hrs / ${daysRemaining} days remaining`;
+          } else if (remainingHours > 0 && remainingHours <= 40) {
+            remaining_display = `${remainingHours} hours remaining`;
+          } else if (daysRemaining && daysRemaining > 0 && daysRemaining <= 4) {
+            remaining_display = `${daysRemaining} days remaining`;
+          } else {
+            remaining_display = 'Due soon';
+          }
+        } else {
+          if (remainingHours > 0 && daysRemaining && daysRemaining > 0) {
+            remaining_display = `${remainingHours} hrs / ${daysRemaining} days to service`;
+          } else if (remainingHours > 0) {
+            remaining_display = `${remainingHours} hours to service`;
+          } else if (daysRemaining && daysRemaining > 0) {
+            remaining_display = `${daysRemaining} days to service`;
+          } else {
+            remaining_display = 'Up to date';
+          }
+        }
+        
+        if (cleanItem.next_service_date) {
+          next_date_display = `📅 Due: ${new Date(cleanItem.next_service_date).toLocaleDateString()}`;
+        }
+        
+      } else if (cleanItem.maintenance_type === 'month') {
+        let daysRemaining = null;
+        if (cleanItem.next_service_date) {
+          const nextDate = new Date(cleanItem.next_service_date);
+          daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
+          if (daysRemaining < 0) {
+            status = 'overdue';
+            statusText = '🔴 OVERDUE';
+            statusColor = '#e74c3c';
+            remaining_display = `Overdue by ${Math.abs(daysRemaining)} days`;
+          } else if (daysRemaining <= 4) {
+            status = 'due_soon';
+            statusText = '🟡 DUE SOON';
+            statusColor = '#f39c12';
+            remaining_display = `${daysRemaining} days remaining`;
+          } else {
+            remaining_display = `${daysRemaining} days until service`;
+          }
+          next_date_display = `📅 Next: ${nextDate.toLocaleDateString()}`;
+        } else {
+          remaining_display = 'No service date set';
+        }
+        
+      } else if (cleanItem.maintenance_type === 'year') {
+        let daysRemaining = null;
+        if (cleanItem.next_service_date) {
+          const nextDate = new Date(cleanItem.next_service_date);
+          daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
+          if (daysRemaining < 0) {
+            status = 'overdue';
+            statusText = '🔴 OVERDUE';
+            statusColor = '#e74c3c';
+            remaining_display = `Overdue by ${Math.abs(daysRemaining)} days`;
+          } else if (daysRemaining <= 30) {
+            status = 'due_soon';
+            statusText = '🟡 DUE SOON';
+            statusColor = '#f39c12';
+            remaining_display = `${daysRemaining} days remaining`;
+          } else {
+            remaining_display = `${daysRemaining} days until service`;
+          }
+          next_date_display = `📅 Next: ${nextDate.toLocaleDateString()}`;
+        } else {
+          remaining_display = 'No service date set';
+        }
+      }
+      
+      return {
+        ...cleanItem,
+        status,
+        statusText,
+        statusColor,
+        remaining_display,
+        next_date_display,
+        current_service_display: cleanItem.last_service_date || cleanItem.last_service_full_date || 'Not recorded',
+        next_service_column: next_date_display || remaining_display || 'Up to date'
+      };
     });
+    
     res.json({ success: true, equipment: itemsWithStatus });
   } catch (err) {
     console.error('Error fetching maintenance:', err.message);
@@ -629,6 +764,7 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
     let args = [];
     let current_hours = last_service_hours || 0;
     let target_hours = service_interval_hours || 0;
+    let next_service_date = null;
     
     if (maintenance_type === 'hour') {
       query = `INSERT INTO gse_maintenance 
@@ -653,36 +789,52 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
         req.user.username
       ];
     } else if (maintenance_type === 'month') {
+      // Calculate next service date
+      if (last_service_date) {
+        const date = new Date(last_service_date);
+        date.setMonth(date.getMonth() + (service_interval_months || 6));
+        next_service_date = date.toISOString().split('T')[0];
+      }
+      
       query = `INSERT INTO gse_maintenance 
                (equipment_name, equipment_type, maintenance_type, 
-                service_interval_months, last_service_date,
+                service_interval_months, last_service_date, next_service_date,
                 service_performed, technician_name, notes, 
                 status, created_by, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
       args = [
         equipment_name,
         equipment_type || '',
         maintenance_type,
         service_interval_months || 6,
         last_service_date || null,
+        next_service_date,
         service_performed || '',
         technician_name || '',
         notes || '',
         req.user.username
       ];
     } else if (maintenance_type === 'year') {
+      // Calculate next service date
+      if (last_service_date) {
+        const date = new Date(last_service_date);
+        date.setFullYear(date.getFullYear() + (service_interval_years || 1));
+        next_service_date = date.toISOString().split('T')[0];
+      }
+      
       query = `INSERT INTO gse_maintenance 
                (equipment_name, equipment_type, maintenance_type, 
-                service_interval_years, last_service_full_date,
+                service_interval_years, last_service_full_date, next_service_date,
                 service_performed, technician_name, notes, 
                 status, created_by, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
       args = [
         equipment_name,
         equipment_type || '',
         maintenance_type,
         service_interval_years || 1,
         last_service_date || null,
+        next_service_date,
         service_performed || '',
         technician_name || '',
         notes || '',
@@ -705,8 +857,7 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
     }
     
     const result = await db.execute({ sql: query, args: args });
-    const newId = typeof result.lastInsertRowid === 'bigint' ? Number(result.lastInsertRowid) : result.lastInsertRowid;
-    res.json({ success: true, message: 'Equipment added successfully!', id: newId });
+    res.json({ success: true, message: 'Equipment added successfully!', id: Number(result.lastInsertRowid) });
   } catch (err) {
     console.error('Add equipment error:', err.message);
     res.status(500).json({ error: err.message });
@@ -757,7 +908,7 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECORD SERVICE ON MAINTENANCE ==========
+// ========== RECORD SERVICE ON MAINTENANCE (FIXED) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -766,34 +917,45 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     notes, 
     service_date, 
     current_hours,
-    months_interval
+    months_interval,
+    target_hours
   } = req.body;
   
   try {
-    const equipmentResult = await db.execute({ sql: 'SELECT maintenance_type FROM gse_maintenance WHERE id = ?', args: [id] });
+    // Get current equipment data
+    const equipmentResult = await db.execute({ 
+      sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
+      args: [id] 
+    });
+    
     if (equipmentResult.rows.length === 0) {
       return res.status(404).json({ error: 'Equipment not found' });
     }
     
-    const maintenanceType = equipmentResult.rows[0].maintenance_type;
+    const equipment = equipmentResult.rows[0];
+    const maintenanceType = equipment.maintenance_type;
+    
     if (maintenanceType === 'none') {
       return res.status(400).json({ error: 'This item requires no maintenance' });
     }
     
-    let serviceDateValue = service_date || new Date().toISOString().split('T')[0];
-    let currentHoursValue = current_hours !== undefined ? parseInt(current_hours) : 0;
+    const serviceDateValue = service_date || new Date().toISOString().split('T')[0];
+    const currentHoursValue = current_hours !== undefined ? parseInt(current_hours) : (equipment.current_hours || 0);
+    const targetHoursValue = target_hours !== undefined ? parseInt(target_hours) : (equipment.target_hours || equipment.service_interval_hours || 0);
+    const monthsIntervalValue = months_interval !== undefined ? parseInt(months_interval) : 0;
+    
     let next_service_date = null;
-    
-    if (months_interval > 0 && maintenanceType === 'hour') {
-      const date = new Date(serviceDateValue);
-      date.setMonth(date.getMonth() + months_interval);
-      next_service_date = date.toISOString().split('T')[0];
-    }
-    
     let updateQuery = '';
     let updateArgs = [];
     
     if (maintenanceType === 'hour') {
+      // Calculate next service date if months interval is provided
+      if (monthsIntervalValue > 0) {
+        const date = new Date(serviceDateValue);
+        date.setMonth(date.getMonth() + monthsIntervalValue);
+        next_service_date = date.toISOString().split('T')[0];
+      }
+      
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
@@ -801,6 +963,9 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
                          last_service_date = ?,
                          last_service_hours = ?,
                          current_hours = ?,
+                         target_hours = ?,
+                         service_interval_hours = ?,
+                         service_interval_months_for_hour = ?,
                          next_service_date = ?,
                          date_performed = CURRENT_TIMESTAMP, 
                          updated_at = CURRENT_TIMESTAMP,
@@ -813,15 +978,26 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         serviceDateValue,
         currentHoursValue,
         currentHoursValue,
+        targetHoursValue,
+        targetHoursValue,
+        monthsIntervalValue,
         next_service_date,
         id
       ];
+      
     } else if (maintenanceType === 'month') {
+      const interval = parseInt(monthsIntervalValue) || equipment.service_interval_months || 6;
+      const nextDate = new Date(serviceDateValue);
+      nextDate.setMonth(nextDate.getMonth() + interval);
+      next_service_date = nextDate.toISOString().split('T')[0];
+      
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
                          notes = ?,
                          last_service_date = ?,
+                         service_interval_months = ?,
+                         next_service_date = ?,
                          date_performed = CURRENT_TIMESTAMP, 
                          updated_at = CURRENT_TIMESTAMP,
                          status = 'serviced'
@@ -831,15 +1007,25 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         technician_name || '', 
         notes || '', 
         serviceDateValue,
+        interval,
+        next_service_date,
         id
       ];
+      
     } else if (maintenanceType === 'year') {
+      const interval = parseInt(monthsIntervalValue) || equipment.service_interval_years || 1;
+      const nextDate = new Date(serviceDateValue);
+      nextDate.setFullYear(nextDate.getFullYear() + interval);
+      next_service_date = nextDate.toISOString().split('T')[0];
+      
       updateQuery = `UPDATE gse_maintenance 
                      SET service_performed = ?, 
                          technician_name = ?, 
                          notes = ?,
                          last_service_full_date = ?,
                          last_service_year = ?,
+                         service_interval_years = ?,
+                         next_service_date = ?,
                          date_performed = CURRENT_TIMESTAMP, 
                          updated_at = CURRENT_TIMESTAMP,
                          status = 'serviced'
@@ -850,15 +1036,75 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         notes || '', 
         serviceDateValue,
         new Date(serviceDateValue).getFullYear(),
+        interval,
+        next_service_date,
         id
       ];
+      
     } else {
       return res.status(400).json({ error: 'Unsupported maintenance type' });
     }
     
     await db.execute({ sql: updateQuery, args: updateArgs });
     
-    res.json({ success: true, message: 'Service recorded successfully!' });
+    // Fetch the updated record to return
+    const updatedResult = await db.execute({ 
+      sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
+      args: [id] 
+    });
+    
+    const updated = updatedResult.rows[0];
+    
+    // Calculate next service info for response
+    let nextServiceInfo = '';
+    let nextDateFormatted = '';
+    
+    if (maintenanceType === 'hour') {
+      if (targetHoursValue > 0) {
+        const nextHours = currentHoursValue + targetHoursValue;
+        nextServiceInfo = `Next service when meter reaches ${nextHours} hours`;
+        if (next_service_date) {
+          nextServiceInfo += ` OR by date ${new Date(next_service_date).toLocaleDateString()} (whichever comes first)`;
+          nextDateFormatted = new Date(next_service_date).toLocaleDateString();
+        }
+      } else {
+        nextServiceInfo = 'Service recorded';
+      }
+    } else if (maintenanceType === 'month') {
+      if (next_service_date) {
+        nextDateFormatted = new Date(next_service_date).toLocaleDateString();
+        nextServiceInfo = `Next service due on ${nextDateFormatted}`;
+      } else {
+        nextServiceInfo = 'Service recorded';
+      }
+    } else if (maintenanceType === 'year') {
+      if (next_service_date) {
+        nextDateFormatted = new Date(next_service_date).toLocaleDateString();
+        nextServiceInfo = `Next service due on ${nextDateFormatted}`;
+      } else {
+        nextServiceInfo = 'Service recorded';
+      }
+    }
+    
+    console.log(`✅ Service recorded for ${equipment.equipment_name} by ${req.user.username}`);
+    
+    res.json({ 
+      success: true, 
+      message: `✅ Service recorded successfully!\n📅 Service Date: ${serviceDateValue}\n📊 ${nextServiceInfo}`,
+      service_date: serviceDateValue,
+      current_hours: currentHoursValue,
+      target_hours: targetHoursValue,
+      next_due: nextDateFormatted,
+      updated_record: {
+        id: Number(updated.id),
+        equipment_name: updated.equipment_name,
+        last_service_date: updated.last_service_date,
+        current_hours: updated.current_hours,
+        next_service_date: updated.next_service_date,
+        status: updated.status
+      }
+    });
+    
   } catch (err) {
     console.error('Service recording error:', err.message);
     res.status(500).json({ error: err.message });
