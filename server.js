@@ -578,6 +578,118 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   }
 });
 
+// ========== ADD GSE MAINTENANCE EQUIPMENT ==========
+app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+    return res.status(403).json({ error: 'Admin or Manager access required' });
+  }
+
+  const {
+    equipment_name,
+    equipment_type,
+    maintenance_type,
+    service_interval_hours,
+    service_interval_months,
+    service_interval_years,
+    last_service_date,
+    last_service_hours,
+    service_performed,
+    technician_name,
+    notes
+  } = req.body;
+  
+  try {
+    if (!equipment_name) {
+      return res.status(400).json({ error: 'Equipment name is required' });
+    }
+    
+    let query = '';
+    let args = [];
+    let current_hours = last_service_hours || 0;
+    let target_hours = service_interval_hours || 0;
+    
+    if (maintenance_type === 'hour') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type, 
+                service_interval_hours, target_hours, 
+                last_service_date, last_service_hours, current_hours,
+                service_performed, technician_name, notes, 
+                status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_interval_hours || 250,
+        target_hours,
+        last_service_date || null,
+        last_service_hours || 0,
+        current_hours,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else if (maintenance_type === 'month') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type, 
+                service_interval_months, last_service_date,
+                service_performed, technician_name, notes, 
+                status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_interval_months || 6,
+        last_service_date || null,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else if (maintenance_type === 'year') {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type, 
+                service_interval_years, last_service_full_date,
+                service_performed, technician_name, notes, 
+                status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'serviced', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        maintenance_type,
+        service_interval_years || 1,
+        last_service_date || null,
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    } else {
+      query = `INSERT INTO gse_maintenance 
+               (equipment_name, equipment_type, maintenance_type,
+                service_performed, technician_name, notes, 
+                status, created_by, created_at, updated_at)
+               VALUES (?, ?, 'none', ?, ?, ?, 'no_maintenance', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+      args = [
+        equipment_name,
+        equipment_type || '',
+        service_performed || '',
+        technician_name || '',
+        notes || '',
+        req.user.username
+      ];
+    }
+    
+    const result = await db.execute({ sql: query, args: args });
+    res.json({ success: true, message: 'Equipment added successfully!', id: result.lastInsertRowid });
+  } catch (err) {
+    console.error('Add equipment error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== UPDATE MAINTENANCE (Sync back to Part) ==========
 app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -618,6 +730,114 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Maintenance updated and Part synced!' });
   } catch (err) {
     console.error('Update maintenance error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== RECORD SERVICE ON MAINTENANCE ==========
+app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { 
+    service_performed, 
+    technician_name, 
+    notes, 
+    service_date, 
+    current_hours,
+    months_interval
+  } = req.body;
+  
+  try {
+    const equipmentResult = await db.execute({ sql: 'SELECT maintenance_type FROM gse_maintenance WHERE id = ?', args: [id] });
+    if (equipmentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    
+    const maintenanceType = equipmentResult.rows[0].maintenance_type;
+    if (maintenanceType === 'none') {
+      return res.status(400).json({ error: 'This item requires no maintenance' });
+    }
+    
+    let serviceDateValue = service_date || new Date().toISOString().split('T')[0];
+    let currentHoursValue = current_hours !== undefined ? parseInt(current_hours) : 0;
+    let next_service_date = null;
+    
+    if (months_interval > 0 && maintenanceType === 'hour') {
+      const date = new Date(serviceDateValue);
+      date.setMonth(date.getMonth() + months_interval);
+      next_service_date = date.toISOString().split('T')[0];
+    }
+    
+    let updateQuery = '';
+    let updateArgs = [];
+    
+    if (maintenanceType === 'hour') {
+      updateQuery = `UPDATE gse_maintenance 
+                     SET service_performed = ?, 
+                         technician_name = ?, 
+                         notes = ?,
+                         last_service_date = ?,
+                         last_service_hours = ?,
+                         current_hours = ?,
+                         next_service_date = ?,
+                         date_performed = CURRENT_TIMESTAMP, 
+                         updated_at = CURRENT_TIMESTAMP,
+                         status = 'serviced'
+                     WHERE id = ?`;
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        serviceDateValue,
+        currentHoursValue,
+        currentHoursValue,
+        next_service_date,
+        id
+      ];
+    } else if (maintenanceType === 'month') {
+      updateQuery = `UPDATE gse_maintenance 
+                     SET service_performed = ?, 
+                         technician_name = ?, 
+                         notes = ?,
+                         last_service_date = ?,
+                         date_performed = CURRENT_TIMESTAMP, 
+                         updated_at = CURRENT_TIMESTAMP,
+                         status = 'serviced'
+                     WHERE id = ?`;
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        serviceDateValue,
+        id
+      ];
+    } else if (maintenanceType === 'year') {
+      updateQuery = `UPDATE gse_maintenance 
+                     SET service_performed = ?, 
+                         technician_name = ?, 
+                         notes = ?,
+                         last_service_full_date = ?,
+                         last_service_year = ?,
+                         date_performed = CURRENT_TIMESTAMP, 
+                         updated_at = CURRENT_TIMESTAMP,
+                         status = 'serviced'
+                     WHERE id = ?`;
+      updateArgs = [
+        service_performed || 'Routine service', 
+        technician_name || '', 
+        notes || '', 
+        serviceDateValue,
+        new Date(serviceDateValue).getFullYear(),
+        id
+      ];
+    } else {
+      return res.status(400).json({ error: 'Unsupported maintenance type' });
+    }
+    
+    await db.execute({ sql: updateQuery, args: updateArgs });
+    
+    res.json({ success: true, message: 'Service recorded successfully!' });
+  } catch (err) {
+    console.error('Service recording error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
