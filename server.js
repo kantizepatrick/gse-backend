@@ -271,6 +271,10 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ========== DUAL CONDITION HOUR CALCULATION ==========
+// This function implements the dual condition logic:
+// - Alert triggers on whichever condition comes FIRST (date OR hours)
+// - Due Soon: ≤ 4 days to date OR ≤ 40 hours to target
+// - Overdue: Date passed OR hours exceeded target
 const calculateDualStatus = (item) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -283,6 +287,8 @@ const calculateDualStatus = (item) => {
   let remaining_hours = targetHours - current_hours;
   
   let hourStatus = null;
+  let hour_days_equivalent = null;
+  
   if (targetHours > 0) {
     if (remaining_hours <= 0) {
       hourStatus = 'overdue';
@@ -291,6 +297,8 @@ const calculateDualStatus = (item) => {
     } else {
       hourStatus = 'serviced';
     }
+    // Calculate approximate days equivalent (assuming 8 hours per day)
+    hour_days_equivalent = Math.ceil(remaining_hours / 8);
   }
   
   let dateStatus = null;
@@ -311,27 +319,51 @@ const calculateDualStatus = (item) => {
     }
   }
   
+  // Determine final status based on whichever condition comes FIRST
   if (hourStatus === 'overdue' || dateStatus === 'overdue') {
     finalStatus = 'overdue';
-    if (hourStatus === 'overdue') alert_reason = `Hours: ${Math.abs(remaining_hours)} hrs over target`;
-    if (dateStatus === 'overdue') alert_reason = `Date: ${Math.abs(days_remaining)} days overdue`;
+    if (hourStatus === 'overdue' && dateStatus === 'overdue') {
+      alert_reason = `Hours: ${Math.abs(remaining_hours)} hrs over target AND Date: ${Math.abs(days_remaining)} days overdue`;
+    } else if (hourStatus === 'overdue') {
+      alert_reason = `Hours: ${Math.abs(remaining_hours)} hrs over target (FIRST condition)`;
+    } else if (dateStatus === 'overdue') {
+      alert_reason = `Date: ${Math.abs(days_remaining)} days overdue (FIRST condition)`;
+    }
   } else if (hourStatus === 'due_soon' || dateStatus === 'due_soon') {
     finalStatus = 'due_soon';
-    if (hourStatus === 'due_soon') alert_reason = `${remaining_hours} hours to target`;
-    if (dateStatus === 'due_soon') alert_reason = `${days_remaining} days to service`;
+    if (hourStatus === 'due_soon' && dateStatus === 'due_soon') {
+      alert_reason = `${remaining_hours} hours (${hour_days_equivalent} days) OR ${days_remaining} days to service - whichever comes FIRST`;
+    } else if (hourStatus === 'due_soon') {
+      alert_reason = `${remaining_hours} hours (${hour_days_equivalent} days) remaining (FIRST condition)`;
+    } else if (dateStatus === 'due_soon') {
+      alert_reason = `${days_remaining} days remaining (FIRST condition)`;
+    }
   }
   
+  // Build display text
   if (targetHours > 0 && item.next_service_date) {
     next_due_display = `📅 ${nextDateStr} OR ⏱️ ${targetHours} hrs (Current: ${current_hours} hrs)`;
     if (remaining_hours > 0) next_due_display += ` | ${remaining_hours} hrs to target`;
     if (days_remaining > 0) next_due_display += ` | ${days_remaining} days to date`;
+    if (remaining_hours <= 0 && days_remaining <= 0) {
+      next_due_display = `🔴 OVERDUE: Both conditions exceeded`;
+    } else if (remaining_hours <= 0) {
+      next_due_display = `🔴 OVERDUE: Hours exceeded target by ${Math.abs(remaining_hours)} hrs`;
+    } else if (days_remaining <= 0) {
+      next_due_display = `🔴 OVERDUE: Service date passed by ${Math.abs(days_remaining)} days`;
+    }
   } else if (targetHours > 0) {
     next_due_display = `⏱️ Target: ${targetHours} hrs (Current: ${current_hours} hrs)`;
-    if (remaining_hours > 0) next_due_display += ` | ${remaining_hours} hrs remaining`;
-    if (remaining_hours <= 0) next_due_display = `🔴 OVERDUE: Target was ${targetHours} hrs (Current: ${current_hours} hrs)`;
+    if (remaining_hours > 0) {
+      next_due_display += ` | ${remaining_hours} hrs (${Math.ceil(remaining_hours / 8)} days) remaining`;
+    }
+    if (remaining_hours <= 0) {
+      next_due_display = `🔴 OVERDUE: Target was ${targetHours} hrs (Current: ${current_hours} hrs)`;
+    }
   } else if (item.next_service_date) {
     next_due_display = `📅 Next service: ${nextDateStr}`;
     if (days_remaining > 0) next_due_display += ` | ${days_remaining} days remaining`;
+    if (days_remaining <= 0) next_due_display = `🔴 OVERDUE: Service was due on ${nextDateStr}`;
   }
   
   return {
@@ -436,7 +468,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ========== GET PARTS (with BigInt fix) ==========
+// ========== GET PARTS ==========
 app.get('/api/parts', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM parts ORDER BY part_number');
@@ -567,7 +599,7 @@ app.delete('/api/parts/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== GET MAINTENANCE (with correct status calculation) ==========
+// ========== GET MAINTENANCE (with Dual Condition Status) ==========
 app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM gse_maintenance ORDER BY equipment_name');
@@ -588,144 +620,115 @@ app.get('/api/gse-maintenance', authenticateToken, async (req, res) => {
           statusText: '⚪ NO MAINTENANCE',
           statusColor: '#95a5a6',
           current_service_display: 'No maintenance required', 
-          next_service_column: '⚪ No maintenance required' 
+          next_service_column: '⚪ No maintenance required',
+          alert_reason: ''
         };
       }
       
-      // Calculate status based on maintenance type
       let status = 'serviced';
-      let remaining_display = '';
-      let next_date_display = '';
       let statusText = '✅ SERVICED';
       let statusColor = '#27ae60';
+      let remaining_display = '';
+      let alert_reason = '';
       
       if (cleanItem.maintenance_type === 'hour') {
-        const currentHours = cleanItem.current_hours || 0;
-        const targetHours = cleanItem.target_hours || cleanItem.service_interval_hours || 0;
-        const remainingHours = targetHours - currentHours;
+        // DUAL CONDITION LOGIC for Hour-based maintenance
+        const calc = calculateDualStatus(cleanItem);
+        status = calc.status;
+        remaining_display = calc.next_due_display;
+        alert_reason = calc.alert_reason;
         
-        if (targetHours > 0) {
-          if (remainingHours <= 0) {
-            status = 'overdue';
-            statusText = '🔴 OVERDUE';
-            statusColor = '#e74c3c';
-          } else if (remainingHours <= 40) {
-            status = 'due_soon';
-            statusText = '🟡 DUE SOON';
-            statusColor = '#f39c12';
-          }
-        }
-        
-        // Check date condition
-        let daysRemaining = null;
-        if (cleanItem.next_service_date) {
-          const nextDate = new Date(cleanItem.next_service_date);
-          daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
-          if (daysRemaining < 0) {
-            status = 'overdue';
-            statusText = '🔴 OVERDUE';
-            statusColor = '#e74c3c';
-          } else if (daysRemaining <= 4 && status !== 'overdue') {
-            status = 'due_soon';
-            statusText = '🟡 DUE SOON';
-            statusColor = '#f39c12';
-          }
-        }
-        
-        // Build display text
         if (status === 'overdue') {
-          if (remainingHours <= 0 && daysRemaining && daysRemaining < 0) {
-            remaining_display = `Overdue: ${Math.abs(remainingHours)} hrs & ${Math.abs(daysRemaining)} days`;
-          } else if (remainingHours <= 0) {
-            remaining_display = `Overdue: ${Math.abs(remainingHours)} hours`;
-          } else if (daysRemaining && daysRemaining < 0) {
-            remaining_display = `Overdue: ${Math.abs(daysRemaining)} days`;
-          } else {
-            remaining_display = 'Overdue';
-          }
+          statusText = '🔴 OVERDUE';
+          statusColor = '#e74c3c';
         } else if (status === 'due_soon') {
-          if (remainingHours > 0 && remainingHours <= 40 && daysRemaining && daysRemaining > 0 && daysRemaining <= 4) {
-            remaining_display = `${remainingHours} hrs / ${daysRemaining} days remaining`;
-          } else if (remainingHours > 0 && remainingHours <= 40) {
-            remaining_display = `${remainingHours} hours remaining`;
-          } else if (daysRemaining && daysRemaining > 0 && daysRemaining <= 4) {
-            remaining_display = `${daysRemaining} days remaining`;
-          } else {
-            remaining_display = 'Due soon';
-          }
+          statusText = '🟡 DUE SOON';
+          statusColor = '#f39c12';
         } else {
-          if (remainingHours > 0 && daysRemaining && daysRemaining > 0) {
-            remaining_display = `${remainingHours} hrs / ${daysRemaining} days to service`;
-          } else if (remainingHours > 0) {
-            remaining_display = `${remainingHours} hours to service`;
-          } else if (daysRemaining && daysRemaining > 0) {
-            remaining_display = `${daysRemaining} days to service`;
-          } else {
-            remaining_display = 'Up to date';
-          }
+          statusText = '✅ SERVICED';
+          statusColor = '#27ae60';
         }
         
-        if (cleanItem.next_service_date) {
-          next_date_display = `📅 Due: ${new Date(cleanItem.next_service_date).toLocaleDateString()}`;
-        }
+        return {
+          ...cleanItem,
+          status,
+          statusText,
+          statusColor,
+          remaining_display,
+          alert_reason,
+          current_hours: calc.current_hours,
+          remaining_hours: calc.remaining_hours,
+          days_remaining: calc.days_remaining,
+          current_service_display: cleanItem.last_service_date ? `${cleanItem.last_service_date} (Current: ${calc.current_hours} hrs, Target: ${calc.targetHours} hrs)` : 'Not recorded',
+          next_service_column: calc.next_due_display
+        };
         
       } else if (cleanItem.maintenance_type === 'month') {
-        let daysRemaining = null;
-        if (cleanItem.next_service_date) {
-          const nextDate = new Date(cleanItem.next_service_date);
-          daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
-          if (daysRemaining < 0) {
-            status = 'overdue';
-            statusText = '🔴 OVERDUE';
-            statusColor = '#e74c3c';
-            remaining_display = `Overdue by ${Math.abs(daysRemaining)} days`;
-          } else if (daysRemaining <= 4) {
-            status = 'due_soon';
-            statusText = '🟡 DUE SOON';
-            statusColor = '#f39c12';
-            remaining_display = `${daysRemaining} days remaining`;
-          } else {
-            remaining_display = `${daysRemaining} days until service`;
-          }
-          next_date_display = `📅 Next: ${nextDate.toLocaleDateString()}`;
+        const calc = calculateMonthStatus(cleanItem.last_service_date, cleanItem.service_interval_months);
+        status = calc.status;
+        
+        if (status === 'overdue') {
+          statusText = '🔴 OVERDUE';
+          statusColor = '#e74c3c';
+          remaining_display = `Overdue by ${calc.daysOverdue} days`;
+          alert_reason = `Service date passed by ${calc.daysOverdue} days`;
+        } else if (status === 'due_soon') {
+          statusText = '🟡 DUE SOON';
+          statusColor = '#f39c12';
+          remaining_display = `${calc.days_remaining} days remaining`;
+          alert_reason = `${calc.days_remaining} days to service date`;
         } else {
-          remaining_display = 'No service date set';
+          statusText = '✅ SERVICED';
+          statusColor = '#27ae60';
+          remaining_display = `${calc.days_remaining} days until service`;
+          alert_reason = '';
         }
         
+        return {
+          ...cleanItem,
+          status,
+          statusText,
+          statusColor,
+          remaining_display,
+          alert_reason,
+          current_service_display: cleanItem.last_service_date || 'Not recorded',
+          next_service_column: calc.nextDueDate ? `📅 ${calc.nextDueDate} (${calc.days_remaining} days remaining)` : 'No date set'
+        };
+        
       } else if (cleanItem.maintenance_type === 'year') {
-        let daysRemaining = null;
-        if (cleanItem.next_service_date) {
-          const nextDate = new Date(cleanItem.next_service_date);
-          daysRemaining = Math.ceil((nextDate - today) / (1000 * 60 * 60 * 24));
-          if (daysRemaining < 0) {
-            status = 'overdue';
-            statusText = '🔴 OVERDUE';
-            statusColor = '#e74c3c';
-            remaining_display = `Overdue by ${Math.abs(daysRemaining)} days`;
-          } else if (daysRemaining <= 30) {
-            status = 'due_soon';
-            statusText = '🟡 DUE SOON';
-            statusColor = '#f39c12';
-            remaining_display = `${daysRemaining} days remaining`;
-          } else {
-            remaining_display = `${daysRemaining} days until service`;
-          }
-          next_date_display = `📅 Next: ${nextDate.toLocaleDateString()}`;
+        const calc = calculateYearStatus(cleanItem.last_service_full_date, cleanItem.service_interval_years);
+        status = calc.status;
+        
+        if (status === 'overdue') {
+          statusText = '🔴 OVERDUE';
+          statusColor = '#e74c3c';
+          remaining_display = `Overdue by ${Math.abs(calc.years_remaining)} years`;
+          alert_reason = `Service year passed`;
+        } else if (status === 'due_soon') {
+          statusText = '🟡 DUE SOON';
+          statusColor = '#f39c12';
+          remaining_display = `${calc.daysRemaining} days remaining`;
+          alert_reason = `${calc.daysRemaining} days to service date`;
         } else {
-          remaining_display = 'No service date set';
+          statusText = '✅ SERVICED';
+          statusColor = '#27ae60';
+          remaining_display = `${calc.daysRemaining} days until service`;
+          alert_reason = '';
         }
+        
+        return {
+          ...cleanItem,
+          status,
+          statusText,
+          statusColor,
+          remaining_display,
+          alert_reason,
+          current_service_display: cleanItem.last_service_full_date ? new Date(cleanItem.last_service_full_date).toLocaleDateString() : 'Not recorded',
+          next_service_column: calc.nextDueDate ? `📅 ${calc.nextDueDate}` : 'No date set'
+        };
       }
       
-      return {
-        ...cleanItem,
-        status,
-        statusText,
-        statusColor,
-        remaining_display,
-        next_date_display,
-        current_service_display: cleanItem.last_service_date || cleanItem.last_service_full_date || 'Not recorded',
-        next_service_column: next_date_display || remaining_display || 'Up to date'
-      };
+      return cleanItem;
     });
     
     res.json({ success: true, equipment: itemsWithStatus });
@@ -789,7 +792,6 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
         req.user.username
       ];
     } else if (maintenance_type === 'month') {
-      // Calculate next service date
       if (last_service_date) {
         const date = new Date(last_service_date);
         date.setMonth(date.getMonth() + (service_interval_months || 6));
@@ -815,7 +817,6 @@ app.post('/api/gse-maintenance', authenticateToken, async (req, res) => {
         req.user.username
       ];
     } else if (maintenance_type === 'year') {
-      // Calculate next service date
       if (last_service_date) {
         const date = new Date(last_service_date);
         date.setFullYear(date.getFullYear() + (service_interval_years || 1));
@@ -908,7 +909,61 @@ app.put('/api/gse-maintenance/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== RECORD SERVICE ON MAINTENANCE (FIXED) ==========
+// ========== UPDATE CURRENT HOURS (Daily Update) ==========
+app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { current_hours } = req.body;
+  
+  try {
+    // Get current equipment to check maintenance type
+    const equipmentResult = await db.execute({ 
+      sql: 'SELECT maintenance_type, target_hours, service_interval_hours FROM gse_maintenance WHERE id = ?', 
+      args: [id] 
+    });
+    
+    if (equipmentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    
+    const equipment = equipmentResult.rows[0];
+    
+    if (equipment.maintenance_type !== 'hour') {
+      return res.status(400).json({ error: 'Hours update only applicable for hour-based maintenance' });
+    }
+    
+    const newHours = parseInt(current_hours);
+    const targetHours = equipment.target_hours || equipment.service_interval_hours || 0;
+    
+    await db.execute({ 
+      sql: 'UPDATE gse_maintenance SET current_hours = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', 
+      args: [newHours, id] 
+    });
+    
+    // Calculate remaining and alert status
+    const remainingHours = targetHours - newHours;
+    let alertStatus = '';
+    if (remainingHours <= 0) {
+      alertStatus = 'OVERDUE';
+    } else if (remainingHours <= 40) {
+      alertStatus = 'DUE SOON';
+    } else {
+      alertStatus = 'OK';
+    }
+    
+    res.json({ 
+      success: true, 
+      message: `Hours updated successfully! Current: ${newHours} hrs, Target: ${targetHours} hrs, Remaining: ${remainingHours} hrs`,
+      alert: alertStatus,
+      current_hours: newHours,
+      remaining_hours: remainingHours
+    });
+  } catch (err) {
+    console.error('Hours update error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== RECORD SERVICE ON MAINTENANCE (with Dual Condition) ==========
 app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { 
@@ -949,7 +1004,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     let updateArgs = [];
     
     if (maintenanceType === 'hour') {
-      // Calculate next service date if months interval is provided
+      // Calculate next service date if months interval is provided (DATE CONDITION)
       if (monthsIntervalValue > 0) {
         const date = new Date(serviceDateValue);
         date.setMonth(date.getMonth() + monthsIntervalValue);
@@ -1047,14 +1102,6 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     await db.execute({ sql: updateQuery, args: updateArgs });
     
-    // Fetch the updated record to return
-    const updatedResult = await db.execute({ 
-      sql: 'SELECT * FROM gse_maintenance WHERE id = ?', 
-      args: [id] 
-    });
-    
-    const updated = updatedResult.rows[0];
-    
     // Calculate next service info for response
     let nextServiceInfo = '';
     let nextDateFormatted = '';
@@ -1064,7 +1111,7 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
         const nextHours = currentHoursValue + targetHoursValue;
         nextServiceInfo = `Next service when meter reaches ${nextHours} hours`;
         if (next_service_date) {
-          nextServiceInfo += ` OR by date ${new Date(next_service_date).toLocaleDateString()} (whichever comes first)`;
+          nextServiceInfo += ` OR by date ${new Date(next_service_date).toLocaleDateString()} (whichever comes FIRST)`;
           nextDateFormatted = new Date(next_service_date).toLocaleDateString();
         }
       } else {
@@ -1090,19 +1137,12 @@ app.post('/api/gse-maintenance/:id/service', authenticateToken, async (req, res)
     
     res.json({ 
       success: true, 
-      message: `✅ Service recorded successfully!\n📅 Service Date: ${serviceDateValue}\n📊 ${nextServiceInfo}`,
+      message: `✅ Service recorded!\n📅 Service Date: ${serviceDateValue}\n⏱️ Current Hours: ${currentHoursValue} hrs\n🎯 Target Hours: ${targetHoursValue} hrs\n📊 ${nextServiceInfo}`,
       service_date: serviceDateValue,
       current_hours: currentHoursValue,
       target_hours: targetHoursValue,
       next_due: nextDateFormatted,
-      updated_record: {
-        id: Number(updated.id),
-        equipment_name: updated.equipment_name,
-        last_service_date: updated.last_service_date,
-        current_hours: updated.current_hours,
-        next_service_date: updated.next_service_date,
-        status: updated.status
-      }
+      dual_condition: maintenanceType === 'hour' ? true : false
     });
     
   } catch (err) {
@@ -1236,19 +1276,6 @@ app.get('/api/requests/my-requests', authenticateToken, async (req, res) => {
   }
 });
 
-// ========== UPDATE CURRENT HOURS ==========
-app.put('/api/gse-maintenance/:id/hours', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { current_hours } = req.body;
-  
-  try {
-    await db.execute({ sql: 'UPDATE gse_maintenance SET current_hours = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', args: [current_hours, id] });
-    res.json({ success: true, message: 'Hours updated successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ========== GET CHECKLIST ==========
 app.get('/api/maintenance-checklist/:maintenanceId', authenticateToken, async (req, res) => {
   try {
@@ -1280,7 +1307,10 @@ app.post('/api/maintenance-checklist/:maintenanceId', authenticateToken, async (
 // ========== GET ATTACHMENTS ==========
 app.get('/api/maintenance-attachments/:maintenanceId', authenticateToken, async (req, res) => {
   try {
-    const result = await db.execute({ sql: 'SELECT id, filename, original_filename, file_type, file_size, uploaded_by, created_at FROM maintenance_attachments WHERE maintenance_id = ? ORDER BY created_at DESC', args: [req.params.maintenanceId] });
+    const result = await db.execute({ 
+      sql: 'SELECT id, filename, original_filename, file_type, file_size, uploaded_by, created_at FROM maintenance_attachments WHERE maintenance_id = ? ORDER BY created_at DESC', 
+      args: [req.params.maintenanceId] 
+    });
     res.json(result.rows);
   } catch (err) {
     console.error('Get attachments error:', err.message);
