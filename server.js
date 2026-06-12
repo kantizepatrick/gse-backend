@@ -14,7 +14,8 @@ const allowedOrigins = [
   'http://localhost:5000',
   'https://gse-frontend.onrender.com',
   'https://casgseinv.onrender.com',
-  'https://gse-backend.onrender.com'
+  'https://gse-backend.onrender.com',
+  'https://cas-backend.onrender.com'
 ];
 
 app.use(cors({
